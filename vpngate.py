@@ -494,7 +494,8 @@ def fetch_edge_pool(session, limit=0):
             if entry in seen:
                 continue
             seen.add(entry)
-            bucket.append({"entry": entry, "isp": _isp_of(tag), "tag": tag, "src": url})
+            bucket.append({"entry": entry, "isp": _isp_of(tag), "tag": tag, "src": url,
+                           "src_host": url.split("/")[2]})
         buckets.append(bucket)
         log("EDGE-POOL", f"[OK:{kind}] {url} -> 新增 {len(bucket)}")
     pool = _interleave_sources(buckets)
@@ -685,7 +686,8 @@ def fetch_relay_pool():
             if entry in seen:
                 continue
             seen.add(entry)
-            bucket.append({"entry": entry, "isp": _isp_of(tag), "tag": tag or src.get("label", ""), "src": url})
+            bucket.append({"entry": entry, "isp": _isp_of(tag), "tag": tag or src.get("label", ""),
+                           "src": url, "src_host": url.split("/")[2]})
         raw_n = len(bucket)
         cap = raw_n
         if RELAY_QUOTA > 0:
@@ -724,6 +726,13 @@ def fetch_relay_pool():
     alive = [r["entry"] for r in rows if r["alive"]]
     log("RELAY", f"探活完成: 存活 {len(alive)}/{len(rows)} (耗时 {time.time() - t0:.1f}s)"
                  f" | 失败样例: " + ", ".join(f"{r['entry']} {r['detail']}" for r in rows if not r["alive"])[:200])
+    per_src = {}
+    for r in rows:
+        h = r.get("src_host") or "-"
+        a, t = per_src.get(h, (0, 0))
+        per_src[h] = (a + (1 if r["alive"] else 0), t + 1)
+    log("RELAY", "各源存活率: " + " | ".join(f"{h} {a}/{t}" for h, (a, t) in per_src.items())
+                  + " (美国 runner 视角, 只反映源池质量, 不代表你的体感)")
     if len(alive) < RELAY_MIN_ALIVE:
         log("RELAY", f"存活数 < {RELAY_MIN_ALIVE}, 判定本功能本次不可用, 不产出中转订阅")
         return [], rows
@@ -852,14 +861,15 @@ def write_outputs(data, pool=None, relay=None, relay_rows=None):
         with open(rows_path, "w", encoding="utf-8") as f:
             for r in relay_rows:
                 f.write(f"{r['entry']}\t{'ALIVE' if r['alive'] else 'DEAD'}\t{r.get('ms') or '-'}"
-                        f"\t{r.get('detail') or '-'}\t{r.get('tag') or '-'}\n")
+                        f"\t{r.get('detail') or '-'}\t{r.get('tag') or '-'}\t{r.get('src_host') or '-'}\n")
         written.append(rows_path)
 
     if pool:
         pool_path = os.path.join(PUBLIC_DIR, "edge_pool.txt")
         with open(pool_path, "w", encoding="utf-8") as f:
             for p in pool:
-                f.write(f"{p['entry']}\t{p.get('isp') or '-'}\t{p.get('tag') or '-'}\t{p.get('dns') or '-'}\n")
+                f.write(f"{p['entry']}\t{p.get('isp') or '-'}\t{p.get('tag') or '-'}"
+                        f"\t{p.get('dns') or '-'}\t{p.get('src_host') or '-'}\n")
         written.append(pool_path)
 
         # 按运营商拆分的订阅: 用户挑自己运营商那一份填进 edgetunnel 即可

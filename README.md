@@ -172,7 +172,7 @@ https://www.wetest.vip/page/cloudflare/cname.html
 > 关键点一：单个 DoH 服务会误杀，`dns.google` 对 `bestcf.top` 返回空记录，而 `cloudflare-dns.com` 能给出 `172.65.x` —— 所以**默认依次问两个服务**。
 > 关键点二：**只有 DoH 全部连不上时才退回系统解析**，否则本地/运营商 DNS 污染会把已死的域名"救活"成看起来可用的 CF IP。
 >
-> 每个域名的判定结论写在 `edge_pool.txt` 第 4 列（`CF确认(x)` / `境外视图无A记录(分线路解析)` / `非CF段(x)` / `NXDOMAIN` …），排查时直接看这个文件。
+> 每个域名的判定结论写在 `edge_pool.txt` 第 4 列（`CF确认(x)` / `境外视图无A记录(分线路解析)` / `非CF段(x)` / `NXDOMAIN` …），第 5 列是该入口的来源域名，排查时直接看这个文件（列序：`入口 / 运营商 / 备注 / DNS判定 / 来源`）。
 >
 > `nodes-cu/cm/ct.txt` 与 `EDGE_ISP` 的内容 = 该运营商标签的优选 IP + 全部优选域名（域名与运营商无关）。若某个运营商标签一条都没有，则不生成对应文件。
 
@@ -192,7 +192,7 @@ https://www.wetest.vip/page/cloudflare/cname.html
 | `EDGE_RELAY_EVERY` | `4` | `append` 模式下每 N 条主池入口插 1 条中转（保证主池仍占多数） |
 | `EDGE_RELAY_MIN_ALIVE` | `3` | 存活数低于此值则判定本次不可用，不产出中转订阅 |
 
-产物：`nodes-relay.txt`（只含探活通过的入口）与 `relay_pool.txt`（调试表：入口 / ALIVE-DEAD / 耗时 / 判定细节 / 备注）。
+产物：`nodes-relay.txt`（只含探活通过的入口）与 `relay_pool.txt`（调试表：`入口 / ALIVE-DEAD / 耗时 / 判定细节 / 备注 / 来源域名`，最后一列用来对比各源的存活率）。日志里还会直接打印一行 `各源存活率: seeck 60/60 | ipdb 52/60`。
 
 内置中转源：
 
