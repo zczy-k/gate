@@ -46,7 +46,8 @@ jobs:
           # EDGE_DOH_ECS: "223.5.5.5"    # 加中国方向 ECS 再问一次; 实测对万网分线路域名无效, 默认关
           # ---- 中转池 (CF 反代 IP, 不做 Cloudflare 段校验, 只探活) ----
           EDGE_RELAY_MODE: "file"        # off=关闭 / file=单独产出 nodes-relay.txt / append=按比例混进 nodes.txt
-          EDGE_RELAY_LIMIT: "120"        # 探活候选上限 (最坏耗时 ≈ 120*4s/8 ≈ 60s)
+          EDGE_RELAY_LIMIT: "120"        # 探活候选总上限 (最坏耗时 ≈ 120*4s/8 ≈ 60s)
+          EDGE_RELAY_QUOTA: "60"         # 每个源最多贡献多少条, 防止一家吃满 (0=不限)
           EDGE_RELAY_TIMEOUT: "4"        # 单个 TCP/TLS 探测超时(秒)
           EDGE_RELAY_CONCURRENCY: "8"    # 探活并发, 别调太高避免被判滥用扫描
           EDGE_RELAY_EVERY: "4"          # append 模式下每 N 条主池入口插 1 条中转

@@ -185,7 +185,8 @@ https://www.wetest.vip/page/cloudflare/cname.html
 | `EDGE_RELAY_MODE` | `off`（workflow 里设为 `file`） | `off` 关闭 / `file` 单独产出 `nodes-relay.txt` / `append` 按比例混进 `nodes.txt` |
 | `EDGE_RELAY_APIS` | seeck + ipdb bestproxy | 用**分号**分隔（URL 内含逗号和 `{}`），条目写法同 `EDGE_POOL_APIS` |
 | `EDGE_RELAY_SNI` | 空 | 填你的伪装域名：探活从「仅 TCP 可连」升级为「TLS 透传 + Cloudflare 证书校验」，能剔除自签假中转 |
-| `EDGE_RELAY_LIMIT` | `120` | 探活候选上限；最坏耗时 ≈ `120 × 4s / 8` ≈ 60s |
+| `EDGE_RELAY_LIMIT` | `120` | 探活候选**总**上限；最坏耗时 ≈ `120 × 4s / 8` ≈ 60s |
+| `EDGE_RELAY_QUOTA` | `60` | **每个源**最多贡献多少条候选（`0`=不限）。不加配额时一家源就能吃满总上限，另一家分不到名额 |
 | `EDGE_RELAY_TIMEOUT` | `4` | 单个 TCP/TLS 探测超时（秒） |
 | `EDGE_RELAY_CONCURRENCY` | `8` | 探活并发。别调太高，容易被目标或中间设备判为滥用扫描 |
 | `EDGE_RELAY_EVERY` | `4` | `append` 模式下每 N 条主池入口插 1 条中转（保证主池仍占多数） |

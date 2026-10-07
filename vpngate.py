@@ -630,7 +630,8 @@ RELAY_MODE = os.environ.get("EDGE_RELAY_MODE", "off").strip().lower()      # off
 RELAY_SNI = os.environ.get("EDGE_RELAY_SNI", "").strip()                    # 你的伪装域名, 填了才做强校验
 RELAY_TIMEOUT = float(os.environ.get("EDGE_RELAY_TIMEOUT", "4"))
 RELAY_CONCURRENCY = max(1, int(os.environ.get("EDGE_RELAY_CONCURRENCY", "8")))
-RELAY_LIMIT = int(os.environ.get("EDGE_RELAY_LIMIT", "120"))                # 探测候选上限
+RELAY_LIMIT = int(os.environ.get("EDGE_RELAY_LIMIT", "120"))                # 探测候选总上限
+RELAY_QUOTA = int(os.environ.get("EDGE_RELAY_QUOTA", "60"))                 # 每个源最多贡献多少条 (0=不限)
 RELAY_MIN_ALIVE = int(os.environ.get("EDGE_RELAY_MIN_ALIVE", "3"))          # 存活太少视为本功能不可用
 RELAY_EVERY = max(0, int(os.environ.get("EDGE_RELAY_EVERY", "4")))          # append 模式: 每 N 条主池插 1 条中转
 RELAY_DEBUG_MIN = 5                                        # 某个源候选数低于此值时把响应原文贴进日志
@@ -685,16 +686,23 @@ def fetch_relay_pool():
                 continue
             seen.add(entry)
             bucket.append({"entry": entry, "isp": _isp_of(tag), "tag": tag or src.get("label", ""), "src": url})
+        raw_n = len(bucket)
+        cap = raw_n
+        if RELAY_QUOTA > 0:
+            cap = min(cap, RELAY_QUOTA)
         if RELAY_LIMIT > 0:
-            bucket = bucket[:max(0, RELAY_LIMIT - len(cand))]
+            cap = min(cap, max(0, RELAY_LIMIT - len(cand)))
+        bucket = bucket[:cap]
         cand.extend(bucket)
         body_lines = len([l for l in r.text.splitlines() if l.strip()])
-        msg = f"[OK:{kind}] {url} -> 候选 {len(bucket)} (累计 {len(cand)}) | 响应 {len(r.text)} 字节 / {body_lines} 行"
-        if len(bucket) < RELAY_DEBUG_MIN:
+        cut = f" (源内 {raw_n} 条, 配额截到 {len(bucket)})" if len(bucket) < raw_n else ""
+        msg = f"[OK:{kind}] {url} -> 候选 {len(bucket)}{cut} (累计 {len(cand)}) | 响应 {len(r.text)} 字节 / {body_lines} 行"
+        if raw_n < RELAY_DEBUG_MIN:
             snippet = re.sub(r"\s+", " ", r.text.strip())[:180]
             msg += f" | 响应开头: {snippet}"
         log("RELAY", msg)
         if RELAY_LIMIT > 0 and len(cand) >= RELAY_LIMIT:
+            log("RELAY", f"已达候选总上限 {RELAY_LIMIT}, 其余源不再拉取")
             break
     if not cand:
         log("RELAY", "没有拿到任何中转候选")
