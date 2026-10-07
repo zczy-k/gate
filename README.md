@@ -135,10 +135,11 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 变量 | 默认 | 说明 |
 | :--- | :--- | :--- |
-| `EDGE_POOL_APIS` | 内置 6 个源 | 整体覆盖入口来源列表，逗号分隔；条目可写 `url`、`url\|json`、`url\|html\|备注` |
-| `EDGE_DOMAIN_DNS_CHECK` | `1` | 优选域名逐个 DoH 反查，解析不到或不在 Cloudflare 段的直接剔除；设 `0` 关闭 |
+| `EDGE_POOL_APIS` | 内置 9 个源 | 整体覆盖入口来源列表，逗号分隔；条目可写 `url`、`url\|json`、`url\|html\|备注` |
+| `EDGE_DOMAIN_DNS_CHECK` | `on` | 优选域名 DoH 反查模式：`on`=分级判定 / `strict`=境外解析不到也剔除 / `off`=不校验 |
+| `EDGE_DOH_URLS` | `dns.google,cloudflare-dns.com` | 反查用的 DoH 服务，**逗号分隔且依次尝试**（多服务是解决分线路误杀的关键） |
+| `EDGE_DOH_ECS` | 空 | 加中国方向 ECS 前缀再问一次。实测对万网分线路域名无效，默认关闭 |
 | `EDGE_WILDCARD_PREFIX` | `bestcf` | 把 `*.example.com` 这类泛域名补成 `bestcf.example.com` |
-| `EDGE_DOH_URL` | `https://dns.google/resolve` | 域名反查用的 DoH 服务 |
 
 内置来源（优选 IP + 优选域名，全部由社区众包、每 12 小时重建）：
 
@@ -159,7 +160,19 @@ https://www.wetest.vip/page/cloudflare/cname.html
 
 > 池子按「来源交错」排序后再轮询入口，避免排在后面的源永远轮不到。
 >
-> 优选域名会先做 **DoH 反查校验**：解析不到、或解析结果不在 Cloudflare 官方段的（例如挂在谷歌云/已被 DNS 污染的死域名）直接剔除，保证进入 `nodes.txt` 的域名确实是 Cloudflare 前端。
+> 优选域名会先做 **DoH 分级反查**（默认 `on`）：
+>
+> | 反查结果 | 处理 | 原因 |
+> | :--- | :--- | :--- |
+> | 解析到 Cloudflare 段 | 保留 | 确认是 CF 前端 |
+> | 解析到但不在 CF 段 | **剔除** | 源站根本不在 Cloudflare（实测抓到挂在谷歌云 `34.41.x` 的假优选域名），当入口必然连不通 |
+> | `NOERROR` 但没有 A 记录 | **保留并标记** | 万网/DNSPod 的**分线路解析**：境外视图本来就是空的，国内用户能解析。`bestcf.top` 属于这一类 |
+> | `SERVFAIL` / `NXDOMAIN` | **剔除** | 域名真死（注册失效或权威 NS 挂了） |
+>
+> 关键点一：单个 DoH 服务会误杀，`dns.google` 对 `bestcf.top` 返回空记录，而 `cloudflare-dns.com` 能给出 `172.65.x` —— 所以**默认依次问两个服务**。
+> 关键点二：**只有 DoH 全部连不上时才退回系统解析**，否则本地/运营商 DNS 污染会把已死的域名"救活"成看起来可用的 CF IP。
+>
+> 每个域名的判定结论写在 `edge_pool.txt` 第 4 列（`CF确认(x)` / `境外视图无A记录(分线路解析)` / `非CF段(x)` / `NXDOMAIN` …），排查时直接看这个文件。
 >
 > `nodes-cu/cm/ct.txt` 与 `EDGE_ISP` 的内容 = 该运营商标签的优选 IP + 全部优选域名（域名与运营商无关）。若某个运营商标签一条都没有，则不生成对应文件。
 
@@ -190,6 +203,8 @@ https://ipdb.api.030101.xyz/?type=bestproxy&country=true
 > ⚠️ **视角限制**：GitHub Actions 在美国，中转探活只能判定「这台机器现在活着、且确实是 TLS 透传」，**测不出它对你好不好用**（美国到阿里云 HK 是 150ms，深圳到它是 20ms）。延迟数字一律不参与排序。要按你的线路选最快的入口，把 `EDGE_FANOUT` 设为 2~3，交给客户端 `url-test` 自选。
 >
 > seeck 的 `/api/nodes` 不带 `region` 会返回 5000+ 条全量且响应很慢，所以默认 URL 里固定带 region 与 `limit`，代码侧还有 `EDGE_RELAY_LIMIT` 二次截断。
+>
+> 每个中转源都会记录 `候选数 / 响应字节 / 行数`；当某源候选数少于 5 条时会把**响应原文前 180 字符**打进日志——用于定位"源被限流"还是"返回了错误页"（实测 Actions 上 seeck 只贡献过 1 条，而本地同一 URL 返回 180 条）。
 
 > 再次强调：`vpngate.py` **不需要**配置 `EDT_UUID` 和 `EDT_DOMAIN`，这两个参数属于 edgetunnel 本身。
 

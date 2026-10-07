@@ -341,8 +341,17 @@ EDGE_POOL_APIS = _sources_from_env("EDGE_POOL_APIS", EDGE_POOL_DEFAULT_SOURCES)
 # (例如 ipdb 的 type=bestproxy 返回的是 Oracle/阿里云 IP, 当入口必然连不通)
 CF_V4_URL = os.environ.get("CF_V4_URL", "https://www.cloudflare.com/ips-v4")
 
-# 域名归属校验用的 DoH 服务 (可换 https://cloudflare-dns.com/dns-query 等)
-EDGE_DOH_URL = os.environ.get("EDGE_DOH_URL", "https://dns.google/resolve")
+# 域名归属校验用的 DoH 服务(依次尝试)。不写死一个是因为优选域名大量使用
+# 「分线路解析」(万网/DNSPod): 境外视图 NOERROR 但无 Answer, 必须靠多视图交叉 + ECS 判断
+EDGE_DOH_URLS = [u.strip() for u in os.environ.get(
+    "EDGE_DOH_URLS",
+    "https://dns.google/resolve,https://cloudflare-dns.com/dns-query",
+).split(",") if u.strip()]
+# 带中国方向 ECS 前缀再问一次。实测 dns.google 对万网分线路域名加 ECS 仍返回空记录,
+# 真正的解法是问第二个 DoH (cloudflare-dns.com), 所以这里默认关闭, 留作可调。
+EDGE_DOH_ECS = os.environ.get("EDGE_DOH_ECS", "").strip()
+# on=分级判定(默认) / strict=解析不到即剔除 / off=不校验
+DNS_CHECK_MODE = os.environ.get("EDGE_DOMAIN_DNS_CHECK", "on").strip().lower()
 
 # 优选域名里有 *.example.com 这种泛域名, 客户端不能直接用, 补一个可用前缀
 WILDCARD_PREFIX = os.environ.get("EDGE_WILDCARD_PREFIX", "bestcf").strip(".") or "bestcf"
@@ -497,28 +506,68 @@ def fetch_edge_pool(session, limit=0):
     log("EDGE-POOL", f"池子合计 {len(pool)} 个入口 (域名 {domain_n} / IP {len(pool) - domain_n}), 运营商标注: {isp_stat}")
     return pool
 
+DNS_STATUS = {1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
+
+def _doh_query(url, host, ecs=None):
+    params = {"name": host, "type": "A"}
+    if ecs:
+        params["edns_client_subnet"] = ecs
+    try:
+        j = requests.get(url, params=params, timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0", "Accept": "application/dns-json"}).json()
+    except Exception:
+        return None
+    ips = [a["data"] for a in (j.get("Answer") or [])
+           if a.get("type") == 1 and _is_ip_literal(a.get("data", "") or "")]
+    return ips, j.get("Status")
+
 def _resolve_domain(host):
-    """优选域名解析: 优先 DoH (避开本机/运营商 DNS 污染造成的误杀), DoH 不可用时退回系统解析"""
-    try:
-        j = requests.get(EDGE_DOH_URL, params={"name": host, "type": "A"}, timeout=8,
-                         headers={"User-Agent": "Mozilla/5.0"}).json()
-        ips = [a["data"] for a in j.get("Answer", []) if a.get("type") == 1 and _is_ip_literal(a.get("data", ""))]
+    """返回 (IP 列表, DNS Status); Status=None 表示所有 DoH 都没答上。
+    依次问多个 DoH -> 无记录时带大陆 ECS 再问一次(还原分线路解析) -> 最后退回系统解析"""
+    status = None
+    for url in EDGE_DOH_URLS:
+        got = _doh_query(url, host)
+        if got is None:
+            continue
+        ips, st = got
         if ips:
-            return ips
-    except Exception:
-        pass
-    try:
-        return [socket.gethostbyname(host)]
-    except Exception:
-        return []
+            return ips, st
+        if status is None:
+            status = st
+    if EDGE_DOH_ECS and status != 3:          # NXDOMAIN 是权威定论, 不必再问
+        for url in EDGE_DOH_URLS:
+            got = _doh_query(url, host, ecs=EDGE_DOH_ECS)
+            if got is None:
+                continue
+            ips, st = got
+            if ips:
+                return ips, st
+            if status is None:
+                status = st
+    # 只有 DoH 全部连不上才退回系统解析; DoH 已给出 NXDOMAIN/SERVFAIL 时不能被本地污染 DNS 翻案
+    if status is None:
+        try:
+            sys_ip = socket.gethostbyname(host)
+            if sys_ip:
+                return [sys_ip], status
+        except Exception:
+            pass
+    return [], status
 
 def _validate_domain_pool(pool, nets):
-    """优选域名逐个反查: 解析不到或不在 CF 段的直接丢弃 (池子里的 IP 原样保留)"""
-    if nets is None or os.environ.get("EDGE_DOMAIN_DNS_CHECK", "1") != "1":
+    """优选域名反查分级判定:
+      解析到 CF 段          -> 保留
+      解析到但不在 CF 段    -> 剔除 (源站不在 Cloudflare, 当入口必然连不通)
+      NOERROR 但无 A 记录   -> 保留并标记 (万网/DNSPod 分线路解析, 境外视图本就为空)
+      SERVFAIL / NXDOMAIN   -> 剔除 (域名真死)
+    """
+    if nets is None or DNS_CHECK_MODE in ("off", "0", "no"):
         return pool
     domains = [p["entry"].partition(":")[0] for p in pool if _is_domain_entry(p["entry"])]
     if not domains:
         return pool
+    log("EDGE-POOL", f"DoH 反查 {len(domains)} 个域名 ({', '.join(u.split('/')[2] for u in EDGE_DOH_URLS)}"
+                     + (f" + 大陆ECS={EDGE_DOH_ECS}" if EDGE_DOH_ECS else "") + ")")
     resolved = {}
     with ThreadPoolExecutor(max_workers=16) as ex:
         fut_map = {ex.submit(_resolve_domain, d): d for d in domains}
@@ -527,20 +576,38 @@ def _validate_domain_pool(pool, nets):
             try:
                 resolved[d] = fut.result()
             except Exception:
-                resolved[d] = []
+                resolved[d] = ([], None)
+    strict = DNS_CHECK_MODE == "strict"
     kept, dropped = [], []
     for p in pool:
         host = p["entry"].partition(":")[0]
         if _is_ip_literal(host):
             kept.append(p)
             continue
-        hits = [i for i in (resolved.get(host) or []) if any(ipaddress.ip_address(i) in n for n in nets)]
+        ips, st = resolved.get(host, ([], None))
+        hits = [i for i in ips if any(ipaddress.ip_address(i) in n for n in nets)]
         if hits:
+            p["dns"] = f"CF确认({hits[0]})"
             kept.append(p)
+        elif ips:
+            p["dns"] = f"非CF段({ips[0]})"
+            dropped.append(f"{host} {p['dns']}")
+        elif st == 3:
+            p["dns"] = "NXDOMAIN"
+            dropped.append(f"{host} NXDOMAIN")
+        elif st not in (0, None):
+            p["dns"] = f"DNS错误({DNS_STATUS.get(st, st)})"
+            dropped.append(f"{host} {p['dns']}")
+        elif strict:
+            p["dns"] = "无A记录(strict剔除)"
+            dropped.append(f"{host} 无A记录")
         else:
-            dropped.append(f"{host}->{(resolved.get(host) or ['NXDOMAIN'])[0]}")
-    kept_domain = len(domains) - len(dropped)
-    log("EDGE-POOL", f"域名 DNS 校验: 保留 {kept_domain}/{len(domains)}"
+            p["dns"] = "境外视图无A记录(分线路解析)"
+            kept.append(p)
+    kept_domain = sum(1 for p in kept if _is_domain_entry(p["entry"]))
+    viewless = sum(1 for p in kept if str(p.get("dns", "")).startswith("境外视图"))
+    log("EDGE-POOL", f"域名校验: 保留 {kept_domain}/{len(domains)}"
+                     + (f" (含 {viewless} 个境外视图无记录的分线路域名)" if viewless else "")
                      + (f", 剔除 {' '.join(dropped[:6])}" if dropped else ""))
     return kept
 
@@ -566,6 +633,7 @@ RELAY_CONCURRENCY = max(1, int(os.environ.get("EDGE_RELAY_CONCURRENCY", "8")))
 RELAY_LIMIT = int(os.environ.get("EDGE_RELAY_LIMIT", "120"))                # 探测候选上限
 RELAY_MIN_ALIVE = int(os.environ.get("EDGE_RELAY_MIN_ALIVE", "3"))          # 存活太少视为本功能不可用
 RELAY_EVERY = max(0, int(os.environ.get("EDGE_RELAY_EVERY", "4")))          # append 模式: 每 N 条主池插 1 条中转
+RELAY_DEBUG_MIN = 5                                        # 某个源候选数低于此值时把响应原文贴进日志
 
 def _probe_relay(entry):
     """L1 TCP 连接; 配了 EDGE_RELAY_SNI 再加 L2 严格 TLS 证书校验(透传型中转原样回传 CF 证书才过)"""
@@ -620,7 +688,12 @@ def fetch_relay_pool():
         if RELAY_LIMIT > 0:
             bucket = bucket[:max(0, RELAY_LIMIT - len(cand))]
         cand.extend(bucket)
-        log("RELAY", f"[OK:{kind}] {url} -> 候选 {len(bucket)} (累计 {len(cand)})")
+        body_lines = len([l for l in r.text.splitlines() if l.strip()])
+        msg = f"[OK:{kind}] {url} -> 候选 {len(bucket)} (累计 {len(cand)}) | 响应 {len(r.text)} 字节 / {body_lines} 行"
+        if len(bucket) < RELAY_DEBUG_MIN:
+            snippet = re.sub(r"\s+", " ", r.text.strip())[:180]
+            msg += f" | 响应开头: {snippet}"
+        log("RELAY", msg)
         if RELAY_LIMIT > 0 and len(cand) >= RELAY_LIMIT:
             break
     if not cand:
@@ -778,7 +851,7 @@ def write_outputs(data, pool=None, relay=None, relay_rows=None):
         pool_path = os.path.join(PUBLIC_DIR, "edge_pool.txt")
         with open(pool_path, "w", encoding="utf-8") as f:
             for p in pool:
-                f.write(f"{p['entry']}\t{p.get('isp') or '-'}\t{p.get('tag') or '-'}\n")
+                f.write(f"{p['entry']}\t{p.get('isp') or '-'}\t{p.get('tag') or '-'}\t{p.get('dns') or '-'}\n")
         written.append(pool_path)
 
         # 按运营商拆分的订阅: 用户挑自己运营商那一份填进 edgetunnel 即可
