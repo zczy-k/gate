@@ -127,9 +127,41 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 常量 | 说明 |
 | :--- | :--- |
-| `EDGE_HOSTS` | 入口优选域名（换域名改这里） |
+| `EDGE_HOSTS` | 内置静态入口表，仅在动态池全部失败时回退 |
 | `WORKER_CHECK_URL` | 检测 Worker（本地运行默认值，Action 里用 workflow 的 `CHECK_WORKER` 覆盖） |
 | `NODES_URL` | 自动更新时用到的固定地址（fork 后改成你自己的） |
+
+### 入口池相关环境变量（在 workflow 的 `env` 里设置）
+
+| 变量 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `EDGE_POOL_APIS` | 内置 6 个源 | 整体覆盖入口来源列表，逗号分隔；条目可写 `url`、`url\|json`、`url\|html\|备注` |
+| `EDGE_DOMAIN_DNS_CHECK` | `1` | 优选域名逐个 DoH 反查，解析不到或不在 Cloudflare 段的直接剔除；设 `0` 关闭 |
+| `EDGE_WILDCARD_PREFIX` | `bestcf` | 把 `*.example.com` 这类泛域名补成 `bestcf.example.com` |
+| `EDGE_DOH_URL` | `https://dns.google/resolve` | 域名反查用的 DoH 服务 |
+
+内置来源（优选 IP + 优选域名，全部由社区众包、每 12 小时重建）：
+
+~~~text
+# 优选 IP
+https://addressesapi.090227.xyz/CloudFlareYes                  带 CM/CU/CT 标签
+https://ipdb.api.030101.xyz/?type=bestcf&country=true
+https://raw.githubusercontent.com/cmliu/WorkerVless2sub/main/addressesapi.txt
+https://raw.githubusercontent.com/DustinWin/BestCF/bestcf/cmcc-ip.txt   移动专用（含 IPv6，自动剔除）
+https://raw.githubusercontent.com/DustinWin/BestCF/bestcf/cucc-ip.txt   联通专用
+https://raw.githubusercontent.com/DustinWin/BestCF/bestcf/ctcc-ip.txt   电信专用
+
+# 优选域名（CNAME 池，客户端 DNS 就近解析）
+https://raw.githubusercontent.com/DustinWin/BestCF/bestcf/bestcf-domain.txt
+https://vps789.com/openApi/cfIpTop20
+https://www.wetest.vip/page/cloudflare/cname.html
+~~~
+
+> 池子按「来源交错」排序后再轮询入口，避免排在后面的源永远轮不到。
+>
+> 优选域名会先做 **DoH 反查校验**：解析不到、或解析结果不在 Cloudflare 官方段的（例如挂在谷歌云/已被 DNS 污染的死域名）直接剔除，保证进入 `nodes.txt` 的域名确实是 Cloudflare 前端。
+>
+> `nodes-cu/cm/ct.txt` 与 `EDGE_ISP` 的内容 = 该运营商标签的优选 IP + 全部优选域名（域名与运营商无关）。若某个运营商标签一条都没有，则不生成对应文件。
 
 > 再次强调：`vpngate.py` **不需要**配置 `EDT_UUID` 和 `EDT_DOMAIN`，这两个参数属于 edgetunnel 本身。
 

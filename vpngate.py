@@ -17,6 +17,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -296,29 +297,63 @@ def build_outputs(results, raw_count, sstp_count, source):
 # ---------------------------------------------------------------------------
 # 自动优选入口池 (动态)
 # ---------------------------------------------------------------------------
-# 众包优选 API: 由大量国内用户/节点实测聚合, 优先级远高于本机在境外机房的测速结果。
-# 格式约定(三种都兼容): "IP" / "IP:port" / "IP#备注" / "IP:port#备注"
-EDGE_POOL_APIS = [
-    a.strip()
-    for a in os.environ.get(
-        "EDGE_POOL_APIS",
-        "https://addressesapi.090227.xyz/CloudFlareYes,"
-        "https://ipdb.api.030101.xyz/?type=bestcf&country=true,"
-        "https://raw.githubusercontent.com/cmliu/WorkerVless2sub/main/addressesapi.txt",
-    ).split(",")
-    if a.strip()
+# 入口来源格式:
+#   text -> 每行 "IP" / "IP:port" / "IP#备注" / "域名:port#备注"
+#   json -> 递归取 ip/domain/host/value 字段里的地址
+#   html -> 用 pattern 正则从页面里抠地址 (优选 CNAME 域名表格)
+# 环境变量 EDGE_POOL_APIS 可整体覆盖, 条目格式 "url" 或 "url|kind|备注"
+EDGE_POOL_DEFAULT_SOURCES = [
+    {"url": "https://addressesapi.090227.xyz/CloudFlareYes", "kind": "text"},
+    {"url": "https://ipdb.api.030101.xyz/?type=bestcf&country=true", "kind": "text"},
+    {"url": "https://raw.githubusercontent.com/cmliu/WorkerVless2sub/main/addressesapi.txt", "kind": "text"},
+    # ---- 优选域名 (社区众包 CNAME 池, 由国内用户实测; 泛域名自动补前缀) ----
+    {"url": "https://raw.githubusercontent.com/DustinWin/BestCF/bestcf/bestcf-domain.txt",
+     "kind": "text", "label": "优选域名"},
+    {"url": "https://vps789.com/openApi/cfIpTop20", "kind": "json", "label": "优选域名"},
+    {"url": "https://www.wetest.vip/page/cloudflare/cname.html",
+     "kind": "html", "label": "优选域名",
+     "pattern": r'(?<=<td data-label="地址名称">)[^<]+'},
+    # ---- 分运营商优选 IP (每 12 小时重建, 备注自带 CMCC/CUCC/CTCC, 让三网专用订阅稳定) ----
+    {"url": "https://raw.githubusercontent.com/DustinWin/BestCF/bestcf/cmcc-ip.txt", "kind": "text"},
+    {"url": "https://raw.githubusercontent.com/DustinWin/BestCF/bestcf/cucc-ip.txt", "kind": "text"},
+    {"url": "https://raw.githubusercontent.com/DustinWin/BestCF/bestcf/ctcc-ip.txt", "kind": "text"},
 ]
+
+_ENV_SOURCES = []
+for _item in os.environ.get("EDGE_POOL_APIS", "").split(","):
+    _item = _item.strip()
+    if not _item:
+        continue
+    _parts = _item.split("|")
+    _ENV_SOURCES.append({"url": _parts[0], "kind": _parts[1] if len(_parts) > 1 else "text",
+                         "label": _parts[2] if len(_parts) > 2 else ""})
+EDGE_POOL_APIS = _ENV_SOURCES or EDGE_POOL_DEFAULT_SOURCES
 
 # Cloudflare 官方 IPv4 段, 用来剔除优选源里混进来的非 CF 脏 IP
 # (例如 ipdb 的 type=bestproxy 返回的是 Oracle/阿里云 IP, 当入口必然连不通)
 CF_V4_URL = os.environ.get("CF_V4_URL", "https://www.cloudflare.com/ips-v4")
 
-_ISP_PAT = re.compile(r"(?:^|[^A-Z])(CM|CU|CT)(?:[^A-Z]|$)", re.I)
+# 域名归属校验用的 DoH 服务 (可换 https://cloudflare-dns.com/dns-query 等)
+EDGE_DOH_URL = os.environ.get("EDGE_DOH_URL", "https://dns.google/resolve")
+
+# 优选域名里有 *.example.com 这种泛域名, 客户端不能直接用, 补一个可用前缀
+WILDCARD_PREFIX = os.environ.get("EDGE_WILDCARD_PREFIX", "bestcf").strip(".") or "bestcf"
+
+_JSON_ADDR_KEYS = ("ip", "domain", "host", "value")
+_DOMAIN_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*\.[A-Za-z]{2,}$"
+)
+_ISP_PAT = re.compile(r"(?:^|[^A-Za-z])(CMCC|CUCC|CTCC|移动|联通|电信|CM|CU|CT)(?:[^A-Za-z]|$)", re.I)
+_ISP_ALIAS = {"CMCC": "CM", "CUCC": "CU", "CTCC": "CT", "移动": "CM", "联通": "CU", "电信": "CT"}
 
 def _isp_of(tag):
-    """从备注里识别运营商标签: CM=移动 CU=联通 CT=电信, 识别不到返回 ''"""
+    """从备注里识别运营商标签: CM=移动 CU=联通 CT=电信, 兼容 CMCC/CUCC/CTCC 写法"""
     m = _ISP_PAT.search(tag or "")
-    return m.group(1).upper() if m else ""
+    if not m:
+        return ""
+    key = m.group(1).upper()
+    return _ISP_ALIAS.get(key, key)
 
 def _load_cf_networks(session):
     try:
@@ -331,53 +366,186 @@ def _load_cf_networks(session):
         log("EDGE-POOL", f"载入 CF 段失败({exc}), 本次跳过 IP 归属校验")
         return None
 
+def _is_ip_literal(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
 def _is_cf_addr(host, nets):
     """域名形态一律放行; IP 形态必须落在 CF 官方段内"""
     if nets is None:
         return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
+    if not _is_ip_literal(host):
         return True
+    ip = ipaddress.ip_address(host)
     return any(ip in n for n in nets)
 
-def fetch_edge_pool(session, limit=0):
-    """聚合多个众包优选 API, 产出 [{entry, isp, tag, src}]"""
-    nets = _load_cf_networks(session)
-    seen, pool = set(), []
-    for api in EDGE_POOL_APIS:
+def _norm_addr(raw):
+    """规范化地址: 去空白/尾点, 泛域名 *.x.com 补前缀; 非法返回 ''"""
+    s = (raw or "").strip().strip('"\'<>,;').rstrip(".")
+    if s.startswith("*."):
+        s = f"{WILDCARD_PREFIX}.{s[2:]}"
+    host = s.partition(":")[0]
+    if not host:
+        return ""
+    if _is_ip_literal(host) or _DOMAIN_RE.match(host):
+        return s
+    return ""
+
+def _walk_json_addrs(node, out=None):
+    out = [] if out is None else out
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str) and k.lower() in _JSON_ADDR_KEYS:
+                addr = _norm_addr(v)
+                if addr:
+                    out.append(addr)
+            else:
+                _walk_json_addrs(v, out)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_json_addrs(item, out)
+    return out
+
+def _iter_pool_entries(src, body):
+    """按来源格式产出 (地址, 备注)"""
+    kind = src.get("kind", "text")
+    if kind == "json":
         try:
-            r = session.get(api, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
+            parsed = json.loads(body)
         except Exception as exc:
-            log("EDGE-POOL", f"[跳过] {api} -> {type(exc).__name__}: {exc}")
+            log("EDGE-POOL", f"[解析失败] {src['url']} -> JSON: {exc}")
+            return
+        for addr in _walk_json_addrs(parsed):
+            yield addr, src.get("label", "")
+        return
+    if kind == "html":
+        pattern = src.get("pattern")
+        if not pattern:
+            return
+        for m in re.findall(pattern, body):
+            addr = _norm_addr(m)
+            if addr:
+                yield addr, src.get("label", "")
+        return
+    for ln in body.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
             continue
-        added = 0
-        for ln in r.text.splitlines():
-            ln = ln.strip()
-            if not ln or ln.startswith("#"):
-                continue
-            addr, _, tag = ln.partition("#")
-            addr, tag = addr.strip(), tag.strip()
-            if not addr:
-                continue
+        addr, _, tag = ln.partition("#")
+        addr = _norm_addr(addr)
+        if addr:
+            yield addr, tag.strip()
+
+def _interleave_sources(buckets):
+    """按来源交错合并: nodes.txt 是轮询取入口的, 不交错的话排后面的源永远轮不到"""
+    out = []
+    for i in range(max((len(b) for b in buckets), default=0)):
+        for b in buckets:
+            if i < len(b):
+                out.append(b[i])
+    return out
+
+def fetch_edge_pool(session, limit=0):
+    """聚合多个众包优选 API/IP 与域名源, 产出 [{entry, isp, tag, src}]"""
+    nets = _load_cf_networks(session)
+    seen, buckets = set(), []
+    for src in EDGE_POOL_APIS:
+        url, kind = src["url"], src.get("kind", "text")
+        try:
+            if kind == "json":
+                r = session.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0",
+                                                          "Accept": "application/json, text/plain, */*"})
+            else:
+                r = session.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            r.encoding = "utf-8"
+        except Exception as exc:
+            log("EDGE-POOL", f"[跳过] {url} -> {type(exc).__name__}: {exc}")
+            continue
+        bucket = []
+        for addr, tag in _iter_pool_entries(src, r.text):
             host, _, port = addr.partition(":")
-            host = host.strip()
-            port = port.strip() or "443"
-            if not host or not _is_cf_addr(host, nets):
+            # 域名一律放行(靠客户端 DNS 就近解析), IP 必须落在 CF 官方段内
+            if not _is_cf_addr(host, nets):
                 continue
-            entry = f"{host}:{port}"
+            if not tag and not _is_ip_literal(host):
+                tag = src.get("label") or tag
+            entry = f"{host}:{port.strip() or '443'}"
             if entry in seen:
                 continue
             seen.add(entry)
-            pool.append({"entry": entry, "isp": _isp_of(tag), "tag": tag, "src": api})
-            added += 1
-        log("EDGE-POOL", f"[OK] {api} -> 新增 {added} (累计 {len(pool)})")
+            bucket.append({"entry": entry, "isp": _isp_of(tag), "tag": tag, "src": url})
+        buckets.append(bucket)
+        log("EDGE-POOL", f"[OK:{kind}] {url} -> 新增 {len(bucket)}")
+    pool = _interleave_sources(buckets)
+    pool = _validate_domain_pool(pool, nets)
     if limit > 0:
         pool = pool[:limit]
     isp_stat = {k: sum(1 for p in pool if p["isp"] == k) for k in ("CM", "CU", "CT")}
-    log("EDGE-POOL", f"池子合计 {len(pool)} 个入口, 运营商标注: {isp_stat}")
+    domain_n = sum(1 for p in pool if _is_domain_entry(p["entry"]))
+    log("EDGE-POOL", f"池子合计 {len(pool)} 个入口 (域名 {domain_n} / IP {len(pool) - domain_n}), 运营商标注: {isp_stat}")
     return pool
+
+def _resolve_domain(host):
+    """优选域名解析: 优先 DoH (避开本机/运营商 DNS 污染造成的误杀), DoH 不可用时退回系统解析"""
+    try:
+        j = requests.get(EDGE_DOH_URL, params={"name": host, "type": "A"}, timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0"}).json()
+        ips = [a["data"] for a in j.get("Answer", []) if a.get("type") == 1 and _is_ip_literal(a.get("data", ""))]
+        if ips:
+            return ips
+    except Exception:
+        pass
+    try:
+        return [socket.gethostbyname(host)]
+    except Exception:
+        return []
+
+def _validate_domain_pool(pool, nets):
+    """优选域名逐个反查: 解析不到或不在 CF 段的直接丢弃 (池子里的 IP 原样保留)"""
+    if nets is None or os.environ.get("EDGE_DOMAIN_DNS_CHECK", "1") != "1":
+        return pool
+    domains = [p["entry"].partition(":")[0] for p in pool if _is_domain_entry(p["entry"])]
+    if not domains:
+        return pool
+    resolved = {}
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        fut_map = {ex.submit(_resolve_domain, d): d for d in domains}
+        for fut in as_completed(fut_map):
+            d = fut_map[fut]
+            try:
+                resolved[d] = fut.result()
+            except Exception:
+                resolved[d] = []
+    kept, dropped = [], []
+    for p in pool:
+        host = p["entry"].partition(":")[0]
+        if _is_ip_literal(host):
+            kept.append(p)
+            continue
+        hits = [i for i in (resolved.get(host) or []) if any(ipaddress.ip_address(i) in n for n in nets)]
+        if hits:
+            kept.append(p)
+        else:
+            dropped.append(f"{host}->{(resolved.get(host) or ['NXDOMAIN'])[0]}")
+    kept_domain = len(domains) - len(dropped)
+    log("EDGE-POOL", f"域名 DNS 校验: 保留 {kept_domain}/{len(domains)}"
+                     + (f", 剔除 {' '.join(dropped[:6])}" if dropped else ""))
+    return kept
+
+def _is_domain_entry(entry):
+    return not _is_ip_literal(entry.partition(":")[0])
+
+def _isp_entries(pool, isp):
+    """运营商专用入口 = 该运营商标签的 IP + 无运营商标签的优选域名 (域名走客户端 DNS, 与运营商无关)"""
+    tagged = [p["entry"] for p in pool if p.get("isp") == isp]
+    if not tagged:
+        return []
+    domains = [p["entry"] for p in pool if not p.get("isp") and _is_domain_entry(p["entry"])]
+    return _interleave_sources([tagged, domains]) if domains else tagged
 
 def resolve_edge(pool=None):
     """确定最终入口池: HOSTS_ENTRY 手填 > 动态池(可按 EDGE_ISP 过滤) > 内置静态表"""
@@ -386,12 +554,13 @@ def resolve_edge(pool=None):
         return [e.strip() for e in manual.split(",") if e.strip()], "HOSTS_ENTRY(手工指定)"
     if pool:
         want = os.environ.get("EDGE_ISP", "").strip().upper()
-        picked = [p["entry"] for p in pool if (not want or p.get("isp") == want)]
-        if picked:
-            label = f"动态优选池({len(picked)}/{len(pool)}" + (f", ISP={want}" if want else "") + ")"
-            return picked, label
-        log("EDGE-POOL", f"动态池中没有 ISP={want} 的入口, 回退使用全池")
-        return [p["entry"] for p in pool], f"动态优选池({len(pool)}, 全量回退)"
+        if want:
+            picked = _isp_entries(pool, want)
+            if picked:
+                return picked, f"动态优选池(ISP={want}: {len(picked)} 入口)"
+            log("EDGE-POOL", f"动态池中没有 ISP={want} 的入口, 回退使用全池")
+            return [p["entry"] for p in pool], f"动态优选池({len(pool)}, ISP={want} 无匹配已回退全池)"
+        return [p["entry"] for p in pool], f"动态优选池({len(pool)})"
     return list(EDGE_HOSTS), "内置静态表(回退)"
 
 # edgetunnel 入口地址池
@@ -471,12 +640,12 @@ def write_outputs(data, pool=None):
 
         # 按运营商拆分的订阅: 用户挑自己运营商那一份填进 edgetunnel 即可
         for isp in ("CM", "CU", "CT"):
-            sub = [p["entry"] for p in pool if p.get("isp") == isp]
+            sub = _isp_entries(pool, isp)
             if not sub:
                 continue
             sub_path = os.path.join(PUBLIC_DIR, f"nodes-{isp.lower()}.txt")
             with open(sub_path, "w", encoding="utf-8") as f:
-                f.write(build_nodes_text(data, sub, f"ISP={isp}(运营商专用, {len(sub)} 入口)"))
+                f.write(build_nodes_text(data, sub, f"ISP={isp}(专用, {len(sub)} 入口)"))
             written.append(sub_path)
 
     return written
