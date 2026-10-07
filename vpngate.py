@@ -799,8 +799,8 @@ NODES_URL = os.environ.get("NODES_URL", "https://zczy-k.github.io/gate/nodes.txt
 # 死节点不会被带进订阅: 必须本轮再次通过 Worker 的 SSTP 握手才会留在 history 里。
 HISTORY_URL = os.environ.get("HISTORY_URL", NODES_URL.rsplit("/", 1)[0] + "/data.json")
 HISTORY_ENABLED = os.environ.get("HISTORY_RECHECK", "1").strip() != "0"
-HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "14"))     # 连续多少天没复测成功就淘汰
-HISTORY_MAX = int(os.environ.get("HISTORY_MAX", "400"))      # history / 复测总量上限
+HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "30"))     # 连续多少天没复测成功就淘汰
+HISTORY_MAX = int(os.environ.get("HISTORY_MAX", "1200"))     # history / 复测总量上限
 HISTORY_TIME_FMT = "%Y-%m-%d %H:%M UTC"
 
 def _parse_hist_time(text):
@@ -1052,7 +1052,7 @@ def main():
     if relay and RELAY_MODE in ("file", "append"):
         base = NODES_URL.rsplit("/", 1)[0]
         log("USAGE", f"中转专用订阅: {base}/nodes-relay.txt (仅判活, 速度请交给客户端 urltest)")
-    log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后每 30 分钟自动更新)")
+    log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后每 4 小时自动更新)")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
 if __name__ == "__main__":

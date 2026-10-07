@@ -1,8 +1,8 @@
 # VPNGate SSTP 家宽节点（edgetunnel 链式代理） 🚀
 
-自动抓取 [VPN Gate](https://www.vpngate.net/) 的 SSTP 家宽/机房节点，调用检测 Worker 逐个验证可用性，按国家分组、标注住宅/机房，生成可直接通过 **URL 自动轮换** 的节点清单。**每 30 分钟自动更新一次。**
+自动抓取 [VPN Gate](https://www.vpngate.net/) 的 SSTP 家宽/机房节点，调用检测 Worker 逐个验证可用性，按国家分组、标注住宅/机房，生成可直接通过 **URL 自动轮换** 的节点清单。**每 4 小时自动更新一次。**
 
-> 核心价值：VPN Gate 的 SSTP 节点 30 分钟就换一批，手动测试筛选太痛苦。本仓库把它全自动了——你只需把 `nodes.txt` 的网址填进 edgetunnel 后台一次，之后节点每 30 分钟自动换，零手动。
+> 核心价值：VPN Gate 官方列表每次只给「当前分数前 100 名」的滚动快照，而且实测约每 37 分钟就换掉 90% 以上的成员，手动测试筛选太痛苦。本仓库把它全自动了——你只需把 `nodes.txt` 的网址填进 edgetunnel 后台一次，之后每 4 小时自动换一批**经过 SSTP 握手复测**的节点，零手动。
 
 ---
 
@@ -10,7 +10,7 @@
 
 ~~~text
 VPN Gate 官方源
-      │  (每 30 分钟，GitHub Actions 定时抓取)
+      │  (每 4 小时，GitHub Actions 定时抓取)
       ▼
 筛选 SSTP 节点 → 去重
       │
@@ -28,7 +28,7 @@ VPN Gate 官方源
 edgetunnel 后台「自定义优选IP」框填 https://…/nodes.txt
       │  edgetunnel 每次生成订阅时自动 fetch → 解析 $sstp:// → 套链式代理
       ▼
-客户端订阅 edgetunnel 订阅 → 使用 SSTP 家宽节点 (每 30 分钟自动换)
+客户端订阅 edgetunnel 订阅 → 使用 SSTP 家宽节点 (每 4 小时自动换)
 ~~~
 
 ---
@@ -104,7 +104,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 3. 点保存
 4. 客户端刷新订阅 → 每次刷新 edgetunnel 都重新拉取一次 nodes.txt，节点自动更新
 
-> 原理：`nodes.txt` 是纯节点行版本（无注释头），每行 `入口域名:443#国家-住宅-01$sstp://vpn:vpn@节点:端口`。edgetunnel 下次生成订阅时会 fetch 这个网址、逐行解析成优选入口 + 链式代理指令。你只填一次，之后节点每 30 分钟自动换、零手动。
+> 原理：`nodes.txt` 是纯节点行版本（无注释头），每行 `入口域名:443#国家-住宅-01$sstp://vpn:vpn@节点:端口`。edgetunnel 下次生成订阅时会 fetch 这个网址、逐行解析成优选入口 + 链式代理指令。你只填一次，之后节点每 4 小时自动换、零手动。
 
 ---
 
@@ -209,18 +209,20 @@ https://ipdb.api.030101.xyz/?type=bestproxy&country=true
 
 ### 历史累积复测
 
-官方 `api/iphone` 现在**每轮只公布约 100 台**（15 列 / 101 行；GitHub 镜像同样 97 台，官网首页也只有 100 个主机名），而且成员每轮轮换。所以单轮筛出来的可用节点必然卡在四十几台——这不是筛选太狠，是源头天花板。
+官方 `api/iphone` 每次只返回**「当前分数前 100 名」的滚动快照**（15 列 / 约 100 行；同一时刻重复请求得到的是字节完全一致的缓存快照）。实测两次相隔 37 分钟的运行：47 台 vs 92 台，**交集只有 4 台（重合率 8%）**——榜单成员每半小时就几乎换血一遍，所以单次抓取永远只能看到 100 台，可用节点也必然卡在四十几台。
 
 解决办法是把**上一轮发布在 Pages 上的 `data.json` 里的 `history` 当种子**，与本轮官方列表合并去重后一起送 Worker 复测：
 
 | 变量 | 默认 | 说明 |
 | :--- | :--- | :--- |
 | `HISTORY_RECHECK` | `1` | 设 `0` 关闭，只用官方当轮列表 |
-| `HISTORY_DAYS` | `14` | 连续这么多天没能复测成功，就从 history 里淘汰 |
-| `HISTORY_MAX` | `400` | 复测总量上限。实测 82 台约 18 秒，400 台约 90 秒 |
+| `HISTORY_DAYS` | `30` | 连续这么多天没能复测成功，就从 history 里淘汰 |
+| `HISTORY_MAX` | `1200` | 复测总量上限。实测 Worker 约 5 台/秒，1200 台约 4 分钟（Job 上限 30 分钟） |
 | `HISTORY_URL` | `<NODES_URL 同目录>/data.json` | 历史数据来源，一般不用改 |
 
-关键点是**安全**：历史节点只是"候选"，必须在本轮重新通过 Worker 的完整 SSTP 握手（`SSTP_DUPLEX_POST` → LCP → PAP(vpn/vpn) → IPCP 分配 IP → 隧道内打靶）才会重新计入结果；已经关机的节点会自然掉出去，不会污染 `nodes.txt`。跑几天后可用节点数会从 45 左右涨到三位数量级（取决于这些历史节点的复活率）。
+关键点是**安全**：历史节点只是"候选"，必须在本轮重新通过 Worker 的完整 SSTP 握手（`SSTP_DUPLEX_POST` → LCP → PAP(vpn/vpn) → IPCP 分配 IP → 隧道内打靶）才会重新计入结果；已经关机的节点会自然掉出去，不会污染 `nodes.txt`。实测开启后同一轮就从 47 台涨到 **92 台**。
+
+> **为什么是每 4 小时**：更新频率直接决定能采到多少个不同快照，所以它是库存规模的一阶因素（每 4 小时 ≈ 每天 6 个快照 ≈ 每天可累加数百候选）。选 4 小时是因为要卡 Actions 免费额度：单次 Job 约 1~2 分钟，每天 1 次 ≈ 60 分钟/月，每 4 小时 ≈ 550 分钟/月，每小时 ≈ 2200 分钟/月**已超过 2000 分钟免费额度**，每 30 分钟 ≈ 4400 分钟不可行。
 
 `data.json` 新增字段：`history`（下轮种子，含 `last_ok` 时间戳）与 `recheck`（本轮补种/复测统计），`stats.history_kept` 是保留条数。
 
@@ -231,12 +233,28 @@ https://ipdb.api.030101.xyz/?type=bestproxy&country=true
 ## 五、常见问题
 
 ### 只有几个节点能连
-入口优选域名大部分被墙。用 bestcf 重新测速，把 `EDGE_HOSTS` 换成实测能通的域名。
+入口优选域名大部分被墙。用 bestcf 重新测速，把 `EDGE_HOSTS` 换成实测能通的域名；或直接确认 `edge_pool.txt` 里动态池是否已生效（日志会打印 `入口来源: 动态优选池(N)`）。
+
+### 节点能连但速度很一般
+这是 SSTP 家宽节点的结构性问题，不是筛选没做好：
+
+- SSTP 是 `TCP over PPP over TLS over TCP` 的四层封装，建链要十几步串行（`SSTP_DUPLEX_POST` → LCP → PAP → IPCP → 内层 TCP），跨境 150~250ms RTT 下光握手就是秒级；检测 Worker 实测 `responseTime` 中位 **3458ms**。
+- 传输期内外两层 TCP 拥塞控制互相干扰，跨境链路丢一个包内层就 RTO 崩塌，吞吐天花板很低。
+- **住宅 ≠ 快**：住宅 IP 的价值是 IP 信誉（解锁 AI/支付/流媒体风控），不是带宽。实测住宅节点中位 3458ms、机房节点中位 3181ms（n=3），换机房也救不了。
+- 客户端 `urltest` 只能选「你 → Cloudflare」这段入口，`CF Worker → 家宽 → 目标站` 那段在服务端固定，客户端测不到也选不了。所以 `EDGE_FANOUT` 有用但只解决一半。
+
+想要速度请优先用 Cloudflare 优选 IP/域名做入口 + 换协议（WireGuard/VLESS）；这套仓库的定位是「免风控的家宽出口」。
+
+### 官方列表不是全量，只有前 100 名
+`api/iphone` 返回的是按 `Score` 降序的滚动快照（约 100 行，同一时刻重复请求内容一致），且成员每半小时换血 90% 以上。所以本仓库用「历史累积复测」跨快照累加候选，见第四节。
+
+### 这些节点会记日志
+官方 CSV 里 `LogType` 字段实测**全部是 `2weeks`**（保留 2 周连接日志），没有一个 `none`。只适合一般翻墙/解锁用途。
 
 ### 全部 -1
 检查：edgetunnel 是否部署好、域名是否解析到 Cloudflare、UUID 是否填对、传输协议是否对得上。
 
-### 30 分钟没更新
+### 4 小时没更新
 到 Actions 页看最近一次运行是否成功、cron 是否还在。
 
 ### 检测 Worker 报错
@@ -247,7 +265,7 @@ https://ipdb.api.030101.xyz/?type=bestproxy&country=true
 
 ---
 
-*流水线：GitHub Actions（每 30 分钟 cron） → vpngate.py → 检测 Worker → GitHub Pages*
+*流水线：GitHub Actions（每 4 小时 cron） → vpngate.py → 检测 Worker → GitHub Pages*
 
 ---
 

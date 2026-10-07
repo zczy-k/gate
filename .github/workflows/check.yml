@@ -2,7 +2,7 @@ name: VPN Gate Node Check
 
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 */4 * * *"
   workflow_dispatch:
  
 
@@ -43,10 +43,10 @@ jobs:
           EDGE_FANOUT: "1"       # 如想开启客户端 urltest 自选，改为 2~3
           EDGE_ISP: ""           # 空=全运营商；改为 CU/CM/CT 可按自己运营商限定
           EDGE_DOMAIN_DNS_CHECK: "on"    # on=分级判定(推荐) / strict=境外解析不到就剔 / off=不校验
-          # ---- 历史累积复测 (官方每轮只公布约 100 台, 靠跨轮累积把候选做大) ----
+          # ---- 历史累积复测 (官方每次只给当前分数前 100 名的滚动快照, 且约半小时就换血 90%+) ----
           HISTORY_RECHECK: "1"   # 0=关闭, 只用官方当轮列表
-          HISTORY_DAYS: "14"     # 连续多少天没复测成功就淘汰该历史节点
-          HISTORY_MAX: "400"     # 复测总量上限 (84 台实测约 18s, 400 台约 90s)
+          HISTORY_DAYS: "30"     # 连续多少天没复测成功就淘汰
+          HISTORY_MAX: "1200"    # 复测总量上限 (实测约 5 台/秒, 1200 台约 4 分钟)
           # EDGE_DOH_ECS: "223.5.5.5"    # 加中国方向 ECS 再问一次; 实测对万网分线路域名无效, 默认关
           # ---- 中转池 (CF 反代 IP, 不做 Cloudflare 段校验, 只探活) ----
           EDGE_RELAY_MODE: "file"        # off=关闭 / file=单独产出 nodes-relay.txt / append=按比例混进 nodes.txt
