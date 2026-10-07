@@ -13,6 +13,7 @@ VPN Gate SSTP 节点检测流水线 (精简版)
 import base64
 import csv
 import io
+import ipaddress
 import json
 import os
 import re
@@ -292,6 +293,107 @@ def build_outputs(results, raw_count, sstp_count, source):
     data = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "source": source, "worker": WORKER_CHECK_URL, "stats": stats, "countries": by_country, "available": available}
     return data
 
+# ---------------------------------------------------------------------------
+# 自动优选入口池 (动态)
+# ---------------------------------------------------------------------------
+# 众包优选 API: 由大量国内用户/节点实测聚合, 优先级远高于本机在境外机房的测速结果。
+# 格式约定(三种都兼容): "IP" / "IP:port" / "IP#备注" / "IP:port#备注"
+EDGE_POOL_APIS = [
+    a.strip()
+    for a in os.environ.get(
+        "EDGE_POOL_APIS",
+        "https://addressesapi.090227.xyz/CloudFlareYes,"
+        "https://ipdb.api.030101.xyz/?type=bestcf&country=true,"
+        "https://raw.githubusercontent.com/cmliu/WorkerVless2sub/main/addressesapi.txt",
+    ).split(",")
+    if a.strip()
+]
+
+# Cloudflare 官方 IPv4 段, 用来剔除优选源里混进来的非 CF 脏 IP
+# (例如 ipdb 的 type=bestproxy 返回的是 Oracle/阿里云 IP, 当入口必然连不通)
+CF_V4_URL = os.environ.get("CF_V4_URL", "https://www.cloudflare.com/ips-v4")
+
+_ISP_PAT = re.compile(r"(?:^|[^A-Z])(CM|CU|CT)(?:[^A-Z]|$)", re.I)
+
+def _isp_of(tag):
+    """从备注里识别运营商标签: CM=移动 CU=联通 CT=电信, 识别不到返回 ''"""
+    m = _ISP_PAT.search(tag or "")
+    return m.group(1).upper() if m else ""
+
+def _load_cf_networks(session):
+    try:
+        r = session.get(CF_V4_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        nets = [ipaddress.ip_network(ln.strip()) for ln in r.text.splitlines() if ln.strip()]
+        log("EDGE-POOL", f"载入 Cloudflare 官方段: {len(nets)} 条")
+        return nets
+    except Exception as exc:
+        log("EDGE-POOL", f"载入 CF 段失败({exc}), 本次跳过 IP 归属校验")
+        return None
+
+def _is_cf_addr(host, nets):
+    """域名形态一律放行; IP 形态必须落在 CF 官方段内"""
+    if nets is None:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return any(ip in n for n in nets)
+
+def fetch_edge_pool(session, limit=0):
+    """聚合多个众包优选 API, 产出 [{entry, isp, tag, src}]"""
+    nets = _load_cf_networks(session)
+    seen, pool = set(), []
+    for api in EDGE_POOL_APIS:
+        try:
+            r = session.get(api, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+        except Exception as exc:
+            log("EDGE-POOL", f"[跳过] {api} -> {type(exc).__name__}: {exc}")
+            continue
+        added = 0
+        for ln in r.text.splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            addr, _, tag = ln.partition("#")
+            addr, tag = addr.strip(), tag.strip()
+            if not addr:
+                continue
+            host, _, port = addr.partition(":")
+            host = host.strip()
+            port = port.strip() or "443"
+            if not host or not _is_cf_addr(host, nets):
+                continue
+            entry = f"{host}:{port}"
+            if entry in seen:
+                continue
+            seen.add(entry)
+            pool.append({"entry": entry, "isp": _isp_of(tag), "tag": tag, "src": api})
+            added += 1
+        log("EDGE-POOL", f"[OK] {api} -> 新增 {added} (累计 {len(pool)})")
+    if limit > 0:
+        pool = pool[:limit]
+    isp_stat = {k: sum(1 for p in pool if p["isp"] == k) for k in ("CM", "CU", "CT")}
+    log("EDGE-POOL", f"池子合计 {len(pool)} 个入口, 运营商标注: {isp_stat}")
+    return pool
+
+def resolve_edge(pool=None):
+    """确定最终入口池: HOSTS_ENTRY 手填 > 动态池(可按 EDGE_ISP 过滤) > 内置静态表"""
+    manual = os.environ.get("HOSTS_ENTRY", "").strip()
+    if manual:
+        return [e.strip() for e in manual.split(",") if e.strip()], "HOSTS_ENTRY(手工指定)"
+    if pool:
+        want = os.environ.get("EDGE_ISP", "").strip().upper()
+        picked = [p["entry"] for p in pool if (not want or p.get("isp") == want)]
+        if picked:
+            label = f"动态优选池({len(picked)}/{len(pool)}" + (f", ISP={want}" if want else "") + ")"
+            return picked, label
+        log("EDGE-POOL", f"动态池中没有 ISP={want} 的入口, 回退使用全池")
+        return [p["entry"] for p in pool], f"动态优选池({len(pool)}, 全量回退)"
+    return list(EDGE_HOSTS), "内置静态表(回退)"
+
 # edgetunnel 入口地址池
 EDGE_HOSTS = [
     h.strip()
@@ -306,11 +408,13 @@ EDGE_HOSTS = [
 
 NODES_URL = os.environ.get("NODES_URL", "https://zczy-k.github.io/gate/nodes.txt")
 
-def build_nodes_text(data):
+def build_nodes_text(data, edge=None, label="内置静态表"):
     """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
     countries = data["countries"]
-    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
+    if not edge:
+        edge, label = list(EDGE_HOSTS), "内置静态表(回退)"
+    fanout = max(1, int(os.environ.get("EDGE_FANOUT", "1")))
+    log("EDGE", f"入口来源: {label} | 入口数 {len(edge)} | 每节点入口数 {fanout}")
     lines = []
     idx = 0
     ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
@@ -318,23 +422,27 @@ def build_nodes_text(data):
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
         nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
-        for i, n in enumerate(res_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-        for i, n in enumerate(dc_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+        groups = (
+            ("住宅", [n for n in nodes if n.get("residential") == "residential"]),
+            ("机房", [n for n in nodes if n.get("residential") != "residential"]),
+        )
+        for kind, sel in groups:
+            for i, n in enumerate(sel, 1):
+                for k in range(fanout):
+                    entry = edge[idx % len(edge)]
+                    idx += 1
+                    suffix = f"-{k + 1}" if fanout > 1 else ""
+                    lines.append(f"{entry}#{zh}-{kind}-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
-def write_outputs(data):
+def write_outputs(data, pool=None):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
+    written = []
+
     data_path = os.path.join(PUBLIC_DIR, "data.json")
     with open(data_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
+    written.append(data_path)
 
     html_path = os.path.join(PUBLIC_DIR, "index.html")
     if os.path.exists(TEMPLATE_HTML):
@@ -346,12 +454,32 @@ def write_outputs(data):
                 "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
+    written.append(html_path)
 
+    edge, label = resolve_edge(pool)
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     with open(nodes_path, "w", encoding="utf-8") as f:
-        f.write(build_nodes_text(data))
+        f.write(build_nodes_text(data, edge, label))
+    written.append(nodes_path)
 
-    return data_path, html_path, nodes_path
+    if pool:
+        pool_path = os.path.join(PUBLIC_DIR, "edge_pool.txt")
+        with open(pool_path, "w", encoding="utf-8") as f:
+            for p in pool:
+                f.write(f"{p['entry']}\t{p.get('isp') or '-'}\t{p.get('tag') or '-'}\n")
+        written.append(pool_path)
+
+        # 按运营商拆分的订阅: 用户挑自己运营商那一份填进 edgetunnel 即可
+        for isp in ("CM", "CU", "CT"):
+            sub = [p["entry"] for p in pool if p.get("isp") == isp]
+            if not sub:
+                continue
+            sub_path = os.path.join(PUBLIC_DIR, f"nodes-{isp.lower()}.txt")
+            with open(sub_path, "w", encoding="utf-8") as f:
+                f.write(build_nodes_text(data, sub, f"ISP={isp}(运营商专用, {len(sub)} 入口)"))
+            written.append(sub_path)
+
+    return written
 
 # ---------------------------------------------------------------------------
 # main
@@ -371,6 +499,8 @@ def main():
 
     if MAX_CHECK_NODES > 0:
         uniq = uniq[:MAX_CHECK_NODES]
+
+    pool = fetch_edge_pool(session, int(os.environ.get("EDGE_POOL_LIMIT", "0")))
 
     log("VPN GATE", f"获取原始节点: {raw_count}")
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
@@ -396,10 +526,12 @@ def main():
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
-    data_path, html_path, nodes_path = write_outputs(data)
-    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
+    written = write_outputs(data, pool)
+    for _p in written:
+        log("WEBSITE", f"生成 {os.path.relpath(_p, REPO_DIR)}")
+    if len(written) > 3:
+        base = NODES_URL.rsplit("/", 1)[0]
+        log("USAGE", f"运营商专用订阅: {base}/nodes-cu.txt(联通) / nodes-cm.txt(移动) / nodes-ct.txt(电信)")
     log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后每 30 分钟自动更新)")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
