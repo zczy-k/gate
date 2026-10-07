@@ -38,6 +38,10 @@ jobs:
           CHECK_WORKER: ${{ secrets.DOMAIN }}
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
+          # ---- 自动优选入口池配置 ----
+          EDGE_POOL_LIMIT: "0"   # 0 表示用全部池
+          EDGE_FANOUT: "1"       # 如想开启客户端 urltest 自选，改为 2~3
+          EDGE_ISP: ""           # 空=全运营商；改为 CU/CM/CT 可按自己运营商限定
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
