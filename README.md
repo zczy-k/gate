@@ -163,6 +163,34 @@ https://www.wetest.vip/page/cloudflare/cname.html
 >
 > `nodes-cu/cm/ct.txt` 与 `EDGE_ISP` 的内容 = 该运营商标签的优选 IP + 全部优选域名（域名与运营商无关）。若某个运营商标签一条都没有，则不生成对应文件。
 
+### 中转池（CF 反代 IP）探活
+
+除了 Cloudflare 官方段的优选 IP，还可以额外抓一批**中转/反代 IP**（不在 CF 段内，靠对端按 SNI 把 TLS 转交给 Cloudflare，例如 `8.210.x` 阿里云 HK、`150.230.x` Oracle 这类 VPS）。它们不能用上面的 Cloudflare 段校验（会被全部剔除），所以走独立通道，**只做存活探测**：
+
+| 变量 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `EDGE_RELAY_MODE` | `off`（workflow 里设为 `file`） | `off` 关闭 / `file` 单独产出 `nodes-relay.txt` / `append` 按比例混进 `nodes.txt` |
+| `EDGE_RELAY_APIS` | seeck + ipdb bestproxy | 用**分号**分隔（URL 内含逗号和 `{}`），条目写法同 `EDGE_POOL_APIS` |
+| `EDGE_RELAY_SNI` | 空 | 填你的伪装域名：探活从「仅 TCP 可连」升级为「TLS 透传 + Cloudflare 证书校验」，能剔除自签假中转 |
+| `EDGE_RELAY_LIMIT` | `120` | 探活候选上限；最坏耗时 ≈ `120 × 4s / 8` ≈ 60s |
+| `EDGE_RELAY_TIMEOUT` | `4` | 单个 TCP/TLS 探测超时（秒） |
+| `EDGE_RELAY_CONCURRENCY` | `8` | 探活并发。别调太高，容易被目标或中间设备判为滥用扫描 |
+| `EDGE_RELAY_EVERY` | `4` | `append` 模式下每 N 条主池入口插 1 条中转（保证主池仍占多数） |
+| `EDGE_RELAY_MIN_ALIVE` | `3` | 存活数低于此值则判定本次不可用，不产出中转订阅 |
+
+产物：`nodes-relay.txt`（只含探活通过的入口）与 `relay_pool.txt`（调试表：入口 / ALIVE-DEAD / 耗时 / 判定细节 / 备注）。
+
+内置中转源：
+
+~~~text
+https://proxy.seeck.cn/api/nodes?region=HK%2CJP%2CSG%2CTW&limit=40&format={ip}:{port}%23{name}%20{region}
+https://ipdb.api.030101.xyz/?type=bestproxy&country=true
+~~~
+
+> ⚠️ **视角限制**：GitHub Actions 在美国，中转探活只能判定「这台机器现在活着、且确实是 TLS 透传」，**测不出它对你好不好用**（美国到阿里云 HK 是 150ms，深圳到它是 20ms）。延迟数字一律不参与排序。要按你的线路选最快的入口，把 `EDGE_FANOUT` 设为 2~3，交给客户端 `url-test` 自选。
+>
+> seeck 的 `/api/nodes` 不带 `region` 会返回 5000+ 条全量且响应很慢，所以默认 URL 里固定带 region 与 `limit`，代码侧还有 `EDGE_RELAY_LIMIT` 二次截断。
+
 > 再次强调：`vpngate.py` **不需要**配置 `EDT_UUID` 和 `EDT_DOMAIN`，这两个参数属于 edgetunnel 本身。
 
 ---

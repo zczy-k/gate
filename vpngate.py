@@ -18,6 +18,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -319,15 +320,22 @@ EDGE_POOL_DEFAULT_SOURCES = [
     {"url": "https://raw.githubusercontent.com/DustinWin/BestCF/bestcf/ctcc-ip.txt", "kind": "text"},
 ]
 
-_ENV_SOURCES = []
-for _item in os.environ.get("EDGE_POOL_APIS", "").split(","):
-    _item = _item.strip()
-    if not _item:
-        continue
-    _parts = _item.split("|")
-    _ENV_SOURCES.append({"url": _parts[0], "kind": _parts[1] if len(_parts) > 1 else "text",
-                         "label": _parts[2] if len(_parts) > 2 else ""})
-EDGE_POOL_APIS = _ENV_SOURCES or EDGE_POOL_DEFAULT_SOURCES
+def _sources_from_env(var_name, default, sep=","):
+    """环境变量覆盖来源表; 条目写法 'url' / 'url|kind' / 'url|kind|备注', 条目之间按 sep 分隔"""
+    raw = os.environ.get(var_name, "").strip()
+    if not raw:
+        return default
+    out = []
+    for item in raw.split(sep):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split("|")
+        out.append({"url": parts[0], "kind": parts[1] if len(parts) > 1 else "text",
+                    "label": parts[2] if len(parts) > 2 else ""})
+    return out or default
+
+EDGE_POOL_APIS = _sources_from_env("EDGE_POOL_APIS", EDGE_POOL_DEFAULT_SOURCES)
 
 # Cloudflare 官方 IPv4 段, 用来剔除优选源里混进来的非 CF 脏 IP
 # (例如 ipdb 的 type=bestproxy 返回的是 Oracle/阿里云 IP, 当入口必然连不通)
@@ -536,6 +544,122 @@ def _validate_domain_pool(pool, nets):
                      + (f", 剔除 {' '.join(dropped[:6])}" if dropped else ""))
     return kept
 
+# ---------------------------------------------------------------------------
+# 中转池 (CF 反代/中转 IP, 故意不做 Cloudflare 段校验, 只做存活探测)
+# ---------------------------------------------------------------------------
+# 这些地址不在 CF 官方段内, 靠对端把 TLS 按 SNI 转发给 Cloudflare 才能当 edgetunnel 入口。
+# 视角限制: Actions 在美国, 这里只判定 "活着 / 是不是 TLS 透传", 延迟数字不参与任何排序,
+#           谁对你好用由客户端 urltest 决定。
+EDGE_RELAY_DEFAULT_SOURCES = [
+    # seeck(Senflare) 的 region 用 %2C 分隔; 不写 region 会返回 5000+ 条全量, 必须截断
+    {"url": "https://proxy.seeck.cn/api/nodes?region=HK%2CJP%2CSG%2CTW&limit=40"
+            "&format={ip}:{port}%23{name}%20{region}", "kind": "text", "label": "中转"},
+    {"url": "https://ipdb.api.030101.xyz/?type=bestproxy&country=true", "kind": "text", "label": "中转"},
+]
+# 多个中转源用分号分隔 (URL 里本身带逗号和 {})
+EDGE_RELAY_APIS = _sources_from_env("EDGE_RELAY_APIS", EDGE_RELAY_DEFAULT_SOURCES, sep=";")
+
+RELAY_MODE = os.environ.get("EDGE_RELAY_MODE", "off").strip().lower()      # off | file | append
+RELAY_SNI = os.environ.get("EDGE_RELAY_SNI", "").strip()                    # 你的伪装域名, 填了才做强校验
+RELAY_TIMEOUT = float(os.environ.get("EDGE_RELAY_TIMEOUT", "4"))
+RELAY_CONCURRENCY = max(1, int(os.environ.get("EDGE_RELAY_CONCURRENCY", "8")))
+RELAY_LIMIT = int(os.environ.get("EDGE_RELAY_LIMIT", "120"))                # 探测候选上限
+RELAY_MIN_ALIVE = int(os.environ.get("EDGE_RELAY_MIN_ALIVE", "3"))          # 存活太少视为本功能不可用
+RELAY_EVERY = max(0, int(os.environ.get("EDGE_RELAY_EVERY", "4")))          # append 模式: 每 N 条主池插 1 条中转
+
+def _probe_relay(entry):
+    """L1 TCP 连接; 配了 EDGE_RELAY_SNI 再加 L2 严格 TLS 证书校验(透传型中转原样回传 CF 证书才过)"""
+    host, _, port = entry.partition(":")
+    port = int(port or 443)
+    t0 = time.time()
+    def cost():
+        return round((time.time() - t0) * 1000)
+    try:
+        sock = socket.create_connection((host, port), timeout=RELAY_TIMEOUT)
+    except Exception as exc:
+        return {"alive": False, "detail": f"TCP不通({type(exc).__name__})", "ms": cost()}
+    try:
+        if not RELAY_SNI:
+            return {"alive": True, "detail": "仅TCP(未配SNI)", "ms": cost()}
+        ctx = ssl.create_default_context()
+        try:
+            tls = ctx.wrap_socket(sock, server_hostname=RELAY_SNI)
+            detail = f"TLS透传OK({tls.version()})"
+            tls.close()
+            return {"alive": True, "detail": detail, "ms": cost()}
+        except Exception as exc:
+            return {"alive": False, "detail": f"TLS不过({type(exc).__name__})", "ms": cost()}
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+def fetch_relay_pool():
+    """抓中转池并逐个探活, 返回 (存活入口列表, 全部探测记录)"""
+    seen, cand = set(), []
+    for src in EDGE_RELAY_APIS:
+        url, kind = src["url"], src.get("kind", "text")
+        try:
+            # seeck 服务端要现做聚合+连通检测, 慢的时候可达 1 分钟
+            r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0",
+                                                       "Accept": "text/plain, application/json, */*"})
+            r.raise_for_status()
+            r.encoding = "utf-8"
+        except Exception as exc:
+            log("RELAY", f"[跳过] {url} -> {type(exc).__name__}: {exc}")
+            continue
+        bucket = []
+        for addr, tag in _iter_pool_entries(src, r.text):
+            host, _, port = addr.partition(":")
+            entry = f"{host}:{port.strip() or '443'}"
+            if entry in seen:
+                continue
+            seen.add(entry)
+            bucket.append({"entry": entry, "isp": _isp_of(tag), "tag": tag or src.get("label", ""), "src": url})
+        if RELAY_LIMIT > 0:
+            bucket = bucket[:max(0, RELAY_LIMIT - len(cand))]
+        cand.extend(bucket)
+        log("RELAY", f"[OK:{kind}] {url} -> 候选 {len(bucket)} (累计 {len(cand)})")
+        if RELAY_LIMIT > 0 and len(cand) >= RELAY_LIMIT:
+            break
+    if not cand:
+        log("RELAY", "没有拿到任何中转候选")
+        return [], []
+    log("RELAY", f"开始探活: {len(cand)} 个候选 (并发 {RELAY_CONCURRENCY}, 单个超时 {RELAY_TIMEOUT}s, "
+                 f"SNI={'已配 ' + RELAY_SNI if RELAY_SNI else '未配 -> 仅 TCP 判定'})")
+    t0 = time.time()
+    rows = []
+    with ThreadPoolExecutor(max_workers=RELAY_CONCURRENCY) as ex:
+        fut_map = {ex.submit(_probe_relay, c["entry"]): c for c in cand}
+        for fut in as_completed(fut_map):
+            c = dict(fut_map[fut])
+            try:
+                c.update(fut.result())
+            except Exception as exc:
+                c.update({"alive": False, "detail": f"探测异常({type(exc).__name__})", "ms": None})
+            rows.append(c)
+    rows.sort(key=lambda r: (not r["alive"], r["entry"]))
+    alive = [r["entry"] for r in rows if r["alive"]]
+    log("RELAY", f"探活完成: 存活 {len(alive)}/{len(rows)} (耗时 {time.time() - t0:.1f}s)"
+                 f" | 失败样例: " + ", ".join(f"{r['entry']} {r['detail']}" for r in rows if not r["alive"])[:200])
+    if len(alive) < RELAY_MIN_ALIVE:
+        log("RELAY", f"存活数 < {RELAY_MIN_ALIVE}, 判定本功能本次不可用, 不产出中转订阅")
+        return [], rows
+    return alive, rows
+
+def weave_relay(main, relays, every):
+    """append 模式: 每 every 条主池入口插 1 条中转, 保证主池仍占多数"""
+    if not relays or every <= 0:
+        return list(main)
+    out, ri = [], 0
+    for i, e in enumerate(main, 1):
+        out.append(e)
+        if i % every == 0:
+            out.append(relays[ri % len(relays)])
+            ri += 1
+    return out
+
 def _is_domain_entry(entry):
     return not _is_ip_literal(entry.partition(":")[0])
 
@@ -604,7 +728,7 @@ def build_nodes_text(data, edge=None, label="内置静态表"):
                     lines.append(f"{entry}#{zh}-{kind}-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
-def write_outputs(data, pool=None):
+def write_outputs(data, pool=None, relay=None, relay_rows=None):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     written = []
 
@@ -626,10 +750,29 @@ def write_outputs(data, pool=None):
     written.append(html_path)
 
     edge, label = resolve_edge(pool)
+    if edge and relay and RELAY_MODE == "append":
+        edge = weave_relay(edge, relay, RELAY_EVERY)
+        label = f"{label} + 中转{len(relay)}条(每 {RELAY_EVERY} 条主池插 1 条)"
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     with open(nodes_path, "w", encoding="utf-8") as f:
         f.write(build_nodes_text(data, edge, label))
     written.append(nodes_path)
+
+    if relay and RELAY_MODE in ("file", "append"):
+        relay_label = f"中转池(存活 {len(relay)} 个 | 美国 runner 判活" + \
+                      (f", TLS 透传校验 SNI={RELAY_SNI}" if RELAY_SNI else ", 仅 TCP 校验") + ")"
+        relay_path = os.path.join(PUBLIC_DIR, "nodes-relay.txt")
+        with open(relay_path, "w", encoding="utf-8") as f:
+            f.write(build_nodes_text(data, relay, relay_label))
+        written.append(relay_path)
+
+    if relay_rows:
+        rows_path = os.path.join(PUBLIC_DIR, "relay_pool.txt")
+        with open(rows_path, "w", encoding="utf-8") as f:
+            for r in relay_rows:
+                f.write(f"{r['entry']}\t{'ALIVE' if r['alive'] else 'DEAD'}\t{r.get('ms') or '-'}"
+                        f"\t{r.get('detail') or '-'}\t{r.get('tag') or '-'}\n")
+        written.append(rows_path)
 
     if pool:
         pool_path = os.path.join(PUBLIC_DIR, "edge_pool.txt")
@@ -691,16 +834,23 @@ def main():
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
+    relay, relay_rows = ([], [])
+    if RELAY_MODE != "off":
+        relay, relay_rows = fetch_relay_pool()
+
     data = build_outputs(results, raw_count, sstp_count, source)
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
-    written = write_outputs(data, pool)
+    written = write_outputs(data, pool, relay, relay_rows)
     for _p in written:
         log("WEBSITE", f"生成 {os.path.relpath(_p, REPO_DIR)}")
     if len(written) > 3:
         base = NODES_URL.rsplit("/", 1)[0]
         log("USAGE", f"运营商专用订阅: {base}/nodes-cu.txt(联通) / nodes-cm.txt(移动) / nodes-ct.txt(电信)")
+    if relay and RELAY_MODE in ("file", "append"):
+        base = NODES_URL.rsplit("/", 1)[0]
+        log("USAGE", f"中转专用订阅: {base}/nodes-relay.txt (仅判活, 速度请交给客户端 urltest)")
     log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后每 30 分钟自动更新)")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 

@@ -42,6 +42,13 @@ jobs:
           EDGE_POOL_LIMIT: "0"   # 0 表示用全部池
           EDGE_FANOUT: "1"       # 如想开启客户端 urltest 自选，改为 2~3
           EDGE_ISP: ""           # 空=全运营商；改为 CU/CM/CT 可按自己运营商限定
+          # ---- 中转池 (CF 反代 IP, 不做 Cloudflare 段校验, 只探活) ----
+          EDGE_RELAY_MODE: "file"        # off=关闭 / file=单独产出 nodes-relay.txt / append=按比例混进 nodes.txt
+          EDGE_RELAY_LIMIT: "120"        # 探活候选上限 (最坏耗时 ≈ 120*4s/8 ≈ 60s)
+          EDGE_RELAY_TIMEOUT: "4"        # 单个 TCP/TLS 探测超时(秒)
+          EDGE_RELAY_CONCURRENCY: "8"    # 探活并发, 别调太高避免被判滥用扫描
+          EDGE_RELAY_EVERY: "4"          # append 模式下每 N 条主池入口插 1 条中转
+          # EDGE_RELAY_SNI: "你的伪装域名.com"   # 取消注释并填写: 探活从「仅 TCP 可连」升级为「TLS 透传 + CF 证书校验」
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
