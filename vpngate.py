@@ -791,6 +791,108 @@ EDGE_HOSTS = [
 
 NODES_URL = os.environ.get("NODES_URL", "https://zczy-k.github.io/gate/nodes.txt")
 
+# ---------------------------------------------------------------------------
+# 历史累积复测
+# ---------------------------------------------------------------------------
+# 官方 API 每轮只公布约 100 台, 且成员每轮轮换。把上一轮 data.json 里的成功节点
+# 作为种子合并进本轮候选一起复测, 可用节点数才能超过单轮源头规模。
+# 死节点不会被带进订阅: 必须本轮再次通过 Worker 的 SSTP 握手才会留在 history 里。
+HISTORY_URL = os.environ.get("HISTORY_URL", NODES_URL.rsplit("/", 1)[0] + "/data.json")
+HISTORY_ENABLED = os.environ.get("HISTORY_RECHECK", "1").strip() != "0"
+HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "14"))     # 连续多少天没复测成功就淘汰
+HISTORY_MAX = int(os.environ.get("HISTORY_MAX", "400"))      # history / 复测总量上限
+HISTORY_TIME_FMT = "%Y-%m-%d %H:%M UTC"
+
+def _parse_hist_time(text):
+    try:
+        return datetime.strptime(str(text).strip(), HISTORY_TIME_FMT).replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def fetch_history_nodes(session):
+    """读上一轮发布的 data.json, 返回 (可复测节点列表, 原始 history 条目)"""
+    if not HISTORY_ENABLED:
+        log("HISTORY", "HISTORY_RECHECK=0, 本轮只用官方源")
+        return [], []
+    try:
+        r = session.get(HISTORY_URL, timeout=30, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        if r.status_code != 200:
+            log("HISTORY", f"上一轮数据不可用 (HTTP {r.status_code}), 本轮只用官方源")
+            return [], []
+        prev = r.json()
+    except Exception as exc:
+        log("HISTORY", f"读取 {HISTORY_URL} 失败({type(exc).__name__}), 本轮只用官方源")
+        return [], []
+    entries = prev.get("history") or []
+    if not entries:                       # 首次升级: 用 available 兜底播种
+        entries = [{"host": n.get("host"), "port": n.get("port"), "ip": n.get("ip"),
+                    "country": n.get("country"), "country_code": n.get("country_code"),
+                    "last_ok": n.get("checked_at") or ""} for n in (prev.get("available") or [])]
+        if entries:
+            log("HISTORY", "上一轮还没有 history 字段, 改用 available 播种")
+    nodes, stale = [], 0
+    now = datetime.now(timezone.utc)
+    for e in entries:
+        host = str(e.get("host") or "").strip()
+        try:
+            port = int(e.get("port") or 0)
+        except Exception:
+            port = 0
+        if not host or not (1 <= port <= 65535):
+            continue
+        ts = _parse_hist_time(e.get("last_ok"))
+        if ts is not None and (now - ts).total_seconds() > HISTORY_DAYS * 86400:
+            stale += 1
+            continue
+        nodes.append({"host": host, "port": port, "ip": str(e.get("ip") or ""),
+                      "country": str(e.get("country") or ""),
+                      "country_code": str(e.get("country_code") or ""),
+                      "last_ok": str(e.get("last_ok") or "")})
+    nodes.sort(key=lambda n: n["last_ok"], reverse=True)
+    log("HISTORY", f"载入历史节点 {len(nodes)} 个 (淘汰超过 {HISTORY_DAYS} 天未成功的 {stale} 个) <- {HISTORY_URL}")
+    return nodes, nodes
+
+def merge_history(current, history_nodes):
+    """官方源优先, 历史种子只补官方本轮没公布的 host:port"""
+    seen = {(n["host"].lower(), n["port"]) for n in current}
+    extra = []
+    for n in history_nodes:
+        key = (n["host"].lower(), n["port"])
+        if key in seen:
+            continue
+        seen.add(key)
+        extra.append(n)
+    if HISTORY_MAX > 0:
+        extra = extra[:max(0, HISTORY_MAX - len(current))]
+    return current + extra, len(extra)
+
+def build_history(results, prev_entries):
+    """本轮成功的节点刷新 last_ok; 本轮没测到的旧记录原样保留, 到龄自动出局"""
+    now = datetime.now(timezone.utc).strftime(HISTORY_TIME_FMT)
+    merged = {}
+    for r in results:
+        if not r.get("success"):
+            continue
+        merged[(str(r["host"]).lower(), int(r["port"]))] = {
+            "host": r["host"], "port": int(r["port"]), "ip": r.get("ip") or "",
+            "country": r.get("country") or "", "country_code": r.get("country_code") or "",
+            "last_ok": r.get("checked_at") or now}
+    keep = 0
+    for e in prev_entries:
+        key = (str(e.get("host")).lower(), int(e.get("port")))
+        if key in merged:
+            continue
+        ts = _parse_hist_time(e.get("last_ok"))
+        if ts is not None and (datetime.now(timezone.utc) - ts).total_seconds() > HISTORY_DAYS * 86400:
+            continue
+        merged[key] = {k: e.get(k, "") for k in ("host", "port", "ip", "country", "country_code", "last_ok")}
+        keep += 1
+    out = sorted(merged.values(), key=lambda x: str(x.get("last_ok")), reverse=True)
+    if HISTORY_MAX > 0:
+        out = out[:HISTORY_MAX]
+    log("HISTORY", f"写回 history: 本轮刷新 {len(merged) - keep} 个 + 沿用上轮 {keep} 个 = {len(out)} 个")
+    return out
+
 def build_nodes_text(data, edge=None, label="内置静态表"):
     """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
     countries = data["countries"]
@@ -900,6 +1002,9 @@ def main():
         die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
     uniq = dedupe(sstp_nodes)
 
+    hist_nodes, hist_prev = fetch_history_nodes(session)
+    uniq, hist_added = merge_history(uniq, hist_nodes)
+
     if MAX_CHECK_NODES > 0:
         uniq = uniq[:MAX_CHECK_NODES]
 
@@ -907,7 +1012,7 @@ def main():
 
     log("VPN GATE", f"获取原始节点: {raw_count}")
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
-    log("VPN GATE", f"去重后: {len(uniq)}")
+    log("VPN GATE", f"去重后: {len(uniq) - hist_added} + 历史补种 {hist_added} = 复测 {len(uniq)}")
 
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
@@ -930,8 +1035,13 @@ def main():
         relay, relay_rows = fetch_relay_pool()
 
     data = build_outputs(results, raw_count, sstp_count, source)
+    data["history"] = build_history(results, hist_prev)
+    data["recheck"] = {"seeds": hist_added, "checked_total": len(uniq),
+                       "days": HISTORY_DAYS, "max": HISTORY_MAX, "source": HISTORY_URL}
+    data["stats"]["history_kept"] = len(data["history"])
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
+    log("RESULT", f"history 写入: {len(data['history'])} 个 (下一轮的复测种子)")
 
     written = write_outputs(data, pool, relay, relay_rows)
     for _p in written:

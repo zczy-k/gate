@@ -207,6 +207,23 @@ https://ipdb.api.030101.xyz/?type=bestproxy&country=true
 >
 > 每个中转源都会记录 `候选数 / 响应字节 / 行数`；当某源候选数少于 5 条时会把**响应原文前 180 字符**打进日志——用于定位"源被限流"还是"返回了错误页"（实测 Actions 上 seeck 只贡献过 1 条，而本地同一 URL 返回 180 条）。
 
+### 历史累积复测
+
+官方 `api/iphone` 现在**每轮只公布约 100 台**（15 列 / 101 行；GitHub 镜像同样 97 台，官网首页也只有 100 个主机名），而且成员每轮轮换。所以单轮筛出来的可用节点必然卡在四十几台——这不是筛选太狠，是源头天花板。
+
+解决办法是把**上一轮发布在 Pages 上的 `data.json` 里的 `history` 当种子**，与本轮官方列表合并去重后一起送 Worker 复测：
+
+| 变量 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `HISTORY_RECHECK` | `1` | 设 `0` 关闭，只用官方当轮列表 |
+| `HISTORY_DAYS` | `14` | 连续这么多天没能复测成功，就从 history 里淘汰 |
+| `HISTORY_MAX` | `400` | 复测总量上限。实测 82 台约 18 秒，400 台约 90 秒 |
+| `HISTORY_URL` | `<NODES_URL 同目录>/data.json` | 历史数据来源，一般不用改 |
+
+关键点是**安全**：历史节点只是"候选"，必须在本轮重新通过 Worker 的完整 SSTP 握手（`SSTP_DUPLEX_POST` → LCP → PAP(vpn/vpn) → IPCP 分配 IP → 隧道内打靶）才会重新计入结果；已经关机的节点会自然掉出去，不会污染 `nodes.txt`。跑几天后可用节点数会从 45 左右涨到三位数量级（取决于这些历史节点的复活率）。
+
+`data.json` 新增字段：`history`（下轮种子，含 `last_ok` 时间戳）与 `recheck`（本轮补种/复测统计），`stats.history_kept` 是保留条数。
+
 > 再次强调：`vpngate.py` **不需要**配置 `EDT_UUID` 和 `EDT_DOMAIN`，这两个参数属于 edgetunnel 本身。
 
 ---
