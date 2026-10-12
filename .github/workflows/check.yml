@@ -37,6 +37,13 @@ jobs:
           CHECK_WORKER: ${{ secrets.DOMAIN }}
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "20"
+          # 国家白名单 + 输出顺序; 每国最多 8 个, 不足 3 个时用低速节点补位
+          COUNTRY_PRIORITY: "HK,TW,JP,KR,SG,US"
+          PER_COUNTRY_MAX: "8"
+          PER_COUNTRY_MIN: "3"
+          MAX_OUTPUT_NODES: "30"
+          # 联通用户可直接订阅 nodes-cu.txt; 想让 nodes.txt 也只用联通入口就取消下一行注释
+          # EDGE_ISP: "CU"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
