@@ -6,9 +6,11 @@ VPN Gate SSTP 节点检测流水线 (精简版)
   1. 获取 VPN Gate 原始节点
   2. 只保留带 TCP 入口的 SSTP 节点
   3. 去重
-  4. 并发调用检测 Worker
-  5. 获取并合并优选域名与优选 API (Cloudflare 入口)
-  6. 生成 public/data.json + public/index.html + public/nodes.txt
+  4. 按 VPN Gate 自带质量数据预筛 (带宽 / 在线人数 / 在线时长)
+  5. 并发调用检测 Worker (短超时, 握手慢的直接淘汰)
+  6. 按「有效带宽 = Speed / (NumVpnSessions + 1)」排序, 只输出前 N 个
+  7. 获取并合并优选域名与优选 API (Cloudflare 入口)
+  8. 生成 public/data.json + public/index.html + public/nodes.txt + public/nodes-residential.txt
 """
 
 import base64
@@ -43,11 +45,23 @@ VPNGATE_MIRROR = os.environ.get(
 )
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
+CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "8"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
+
+# ---- 质量筛选 (A1) ----
+# 节点标称带宽下限 (Mbps)。VPN Gate 的 Speed 字段单位是 bps
+MIN_SPEED_MBPS = float(os.environ.get("MIN_SPEED_MBPS", "50"))
+# 节点连续在线时长下限 (小时)。刚上线的节点容易掉线。VPN Gate 的 Uptime 字段单位是毫秒
+MIN_UPTIME_HOURS = float(os.environ.get("MIN_UPTIME_HOURS", "1"))
+# 在线人数上限, 超过的节点带宽被分得太薄。0 = 不限制
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "0"))
+# nodes.txt 最多输出多少个节点 (宽进严出)。0 = 不限制
+MAX_OUTPUT_NODES = int(os.environ.get("MAX_OUTPUT_NODES", "30"))
+# nodes-residential.txt 最多输出多少个住宅节点。0 = 不限制
+MAX_RESIDENTIAL_NODES = int(os.environ.get("MAX_RESIDENTIAL_NODES", "15"))
 
 DATA_CENTER_ORG_KEYWORDS = [
     "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
@@ -160,7 +174,8 @@ def parse_csv(text):
     header = lines[header_idx].lstrip("#").split(",")
     data_lines = lines[header_idx + 1:]
     idx = {}
-    for col in ("hostname", "ip", "countrylong", "countryshort", "openvpn_configdata_base64"):
+    for col in ("hostname", "ip", "score", "ping", "speed", "countrylong", "countryshort",
+                "numvpnsessions", "uptime", "openvpn_configdata_base64"):
         for i, h in enumerate(header):
             if h.strip().lstrip("*").lower() == col:
                 idx[col] = i
@@ -175,6 +190,11 @@ def parse_csv(text):
         "ip": idx.get("ip", 1),
         "countrylong": idx.get("countrylong", 5),
         "countryshort": idx.get("countryshort", 6),
+        "score": idx.get("score", 2),
+        "ping": idx.get("ping", 3),
+        "speed": idx.get("speed", 4),
+        "numvpnsessions": idx.get("numvpnsessions", 7),
+        "uptime": idx.get("uptime", 8),
         "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1),
     }
 
@@ -190,9 +210,27 @@ def parse_csv(text):
             "ip": ip,
             "country_long": fields[pos["countrylong"]].strip(),
             "country_short": fields[pos["countryshort"]].strip(),
+            "score": _to_num(_field(fields, pos["score"])),
+            "ping": _to_num(_field(fields, pos["ping"])),
+            "speed": _to_num(_field(fields, pos["speed"])),
+            "sessions": _to_num(_field(fields, pos["numvpnsessions"])),
+            "uptime": _to_num(_field(fields, pos["uptime"])),
             "config_b64": fields[pos["openvpn_configdata_base64"]].strip(),
         })
     return rows
+
+def _field(fields, i):
+    return fields[i] if 0 <= i < len(fields) else ""
+
+def _to_num(v):
+    """把 CSV / JSON 里的数字字段转成 float, 缺失或非法返回 None (表示未知, 不参与过滤)"""
+    try:
+        v = str(v).strip()
+        if v == "" or v == "-":
+            return None
+        return float(v)
+    except Exception:
+        return None
 
 def parse_mirror_json(data):
     servers = []
@@ -212,6 +250,11 @@ def parse_mirror_json(data):
             "ip": ip,
             "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(),
             "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(),
+            "score": _to_num(s.get("score")),
+            "ping": _to_num(s.get("ping")),
+            "speed": _to_num(s.get("speed")),
+            "sessions": _to_num(s.get("numvpnsessions") or s.get("sessions")),
+            "uptime": _to_num(s.get("uptime")),
             "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip(),
         })
     return rows
@@ -300,8 +343,52 @@ def to_sstp_nodes(rows):
         host = r["host"]
         if not host.endswith(".opengw.net"):
             host = f"{host}.opengw.net"
-        nodes.append({"host": host, "port": port, "ip": r["ip"], "country": r["country_long"], "country_code": r["country_short"]})
+        speed = r.get("speed")
+        sessions = r.get("sessions")
+        nodes.append({
+            "host": host, "port": port, "ip": r["ip"],
+            "country": r["country_long"], "country_code": r["country_short"],
+            "speed_mbps": round(speed / 1e6, 1) if speed is not None else None,
+            "sessions": int(sessions) if sessions is not None else None,
+            "uptime_h": round(r["uptime"] / 3.6e6, 1) if r.get("uptime") is not None else None,
+            "score": r.get("score"),
+            "eff_mbps": effective_mbps(speed, sessions),
+        })
     return nodes
+
+def effective_mbps(speed_bps, sessions):
+    """有效带宽 = 标称带宽 / (在线人数 + 1), 即你连上去大概能分到的带宽 (Mbps)"""
+    if speed_bps is None:
+        return None
+    return round(speed_bps / 1e6 / ((sessions or 0) + 1), 2)
+
+def quality_filter(nodes):
+    """
+    检测前的预筛: 用 VPN Gate 自带的数据先淘汰明显慢/不稳的节点,
+    字段缺失 (None, 比如走了回退镜像) 的不做该项过滤。
+    """
+    kept, drop_speed, drop_uptime, drop_sessions = [], 0, 0, 0
+    for n in nodes:
+        if n["speed_mbps"] is not None and n["speed_mbps"] < MIN_SPEED_MBPS:
+            drop_speed += 1
+            continue
+        if n["uptime_h"] is not None and n["uptime_h"] < MIN_UPTIME_HOURS:
+            drop_uptime += 1
+            continue
+        if MAX_SESSIONS > 0 and n["sessions"] is not None and n["sessions"] > MAX_SESSIONS:
+            drop_sessions += 1
+            continue
+        kept.append(n)
+    log("QUALITY", f"预筛: 带宽 < {MIN_SPEED_MBPS:g} Mbps 淘汰 {drop_speed}, 在线 < {MIN_UPTIME_HOURS:g} 小时淘汰 {drop_uptime}"
+        + (f", 在线人数 > {MAX_SESSIONS} 淘汰 {drop_sessions}" if MAX_SESSIONS > 0 else "")
+        + f", 保留 {len(kept)}")
+    return kept
+
+def rank_key(n):
+    """排序: 有效带宽降序 → 检测延迟升序 → host。未知带宽排最后"""
+    eff = n.get("eff_mbps")
+    lat = n.get("latency_ms")
+    return (eff is None, -(eff or 0), lat is None, lat or 0, n.get("host") or "")
 
 def dedupe(nodes):
     seen = set()
@@ -407,7 +494,7 @@ def build_outputs(results, raw_count, sstp_count, source):
         grp["count"] = len(grp["nodes"])
         grp["residential"] = sum(1 for n in grp["nodes"] if n["residential"] == "residential")
         grp["datacenter"] = sum(1 for n in grp["nodes"] if n["residential"] == "datacenter")
-        grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
+        grp["nodes"].sort(key=rank_key)
         by_country[name] = grp
 
     data = {
@@ -420,29 +507,30 @@ def build_outputs(results, raw_count, sstp_count, source):
     }
     return data
 
-def build_nodes_text(data, edge_hosts):
+def _ranked_available(data):
+    """全部可用节点按有效带宽全局排序 (不再按国家/住宅优先)"""
+    return sorted(data["available"], key=rank_key)
+
+def _node_line(entry, n, rank):
+    code = str(n.get("country_code") or "?").upper()
+    zh = COUNTRY_ZH.get(code) or (code if code != "?" else (n.get("country") or "未知"))
+    tag = "住宅" if n.get("residential") == "residential" else "机房"
+    eff = n.get("eff_mbps")
+    bw = f"-{eff:g}M" if eff is not None else ""
+    return f"{entry}#{rank:02d}-{zh}-{tag}{bw}$sstp://vpn:vpn@{n['host']}:{n['port']}"
+
+def build_nodes_text(data, edge_hosts, residential_only=False, limit=0):
     """
-    生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://...
+    生成纯节点行版本 (无注释): 每行 = 入口地址#序号-国家-住宅/机房-有效带宽$sstp://...
+    节点按有效带宽从高到低排列, 序号越小越快。
     """
-    countries = data["countries"]
+    nodes = _ranked_available(data)
+    if residential_only:
+        nodes = [n for n in nodes if n.get("residential") == "residential"]
+    if limit > 0:
+        nodes = nodes[:limit]
     edge = edge_hosts
-    lines = []
-    idx = 0
-    ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
-    for cname, grp in ordered:
-        code = str(grp.get("code") or "?").upper()
-        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
-        for i, n in enumerate(res_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-        for i, n in enumerate(dc_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+    lines = [_node_line(edge[i % len(edge)], n, i + 1) for i, n in enumerate(nodes)]
     return "\n".join(lines) + "\n"
 
 def write_outputs(data, edge_hosts):
@@ -466,7 +554,12 @@ def write_outputs(data, edge_hosts):
 
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     with open(nodes_path, "w", encoding="utf-8") as f:
-        f.write(build_nodes_text(data, edge_hosts))
+        f.write(build_nodes_text(data, edge_hosts, limit=MAX_OUTPUT_NODES))
+
+    # 只在需要住宅 IP 时使用 (注册账号、过风控等)
+    res_path = os.path.join(PUBLIC_DIR, "nodes-residential.txt")
+    with open(res_path, "w", encoding="utf-8") as f:
+        f.write(build_nodes_text(data, edge_hosts, residential_only=True, limit=MAX_RESIDENTIAL_NODES))
 
     return data_path, html_path, nodes_path
 
@@ -484,14 +577,21 @@ def main():
     sstp_count = len(sstp_nodes)
     if sstp_count == 0:
         die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
+    # 先按有效带宽排序再去重, 同一 host 保留质量最好的那条
+    sstp_nodes.sort(key=rank_key)
     uniq = dedupe(sstp_nodes)
+    deduped_count = len(uniq)
+    uniq = quality_filter(uniq)
+    if not uniq:
+        die(f"预筛后没有节点 (带宽下限 {MIN_SPEED_MBPS:g} Mbps / 在线下限 {MIN_UPTIME_HOURS:g} 小时 过严?), 可调低 MIN_SPEED_MBPS / MIN_UPTIME_HOURS")
 
     if MAX_CHECK_NODES > 0:
         uniq = uniq[:MAX_CHECK_NODES]
 
     log("VPN GATE", f"获取原始节点: {raw_count}")
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
-    log("VPN GATE", f"去重后: {len(uniq)}")
+    log("VPN GATE", f"去重后: {deduped_count}")
+    log("VPN GATE", f"预筛后提交检测: {len(uniq)}")
 
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
@@ -512,6 +612,10 @@ def main():
     data = build_outputs(results, raw_count, sstp_count, source)
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
+    top = sorted(success, key=rank_key)[:5]
+    for i, n in enumerate(top, 1):
+        log("RESULT", f"TOP{i}: {n['host']}:{n['port']} {n.get('country_code')} 有效带宽 {n.get('eff_mbps')} Mbps "
+            f"(标称 {n.get('speed_mbps')} Mbps / {n.get('sessions')} 人在线) 检测延迟 {n.get('latency_ms')} ms")
 
     # 动态拉取 API 并与静态优选域名混合
     edge_hosts = get_combined_edge_hosts()
@@ -519,7 +623,7 @@ def main():
     data_path, html_path, nodes_path = write_outputs(data, edge_hosts)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)} (最多 {MAX_OUTPUT_NODES} 个) 和 nodes-residential.txt (最多 {MAX_RESIDENTIAL_NODES} 个)")
     log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后自动更新)")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
