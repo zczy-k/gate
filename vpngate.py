@@ -6,9 +6,9 @@ VPN Gate SSTP 节点检测流水线 (精简版)
   1. 获取 VPN Gate 原始节点
   2. 只保留带 TCP 入口的 SSTP 节点
   3. 去重
-  4. 按 VPN Gate 自带质量数据预筛 (带宽 / 在线人数 / 在线时长)
-  5. 并发调用检测 Worker (短超时, 握手慢的直接淘汰)
-  6. 按「有效带宽 = Speed / (NumVpnSessions + 1)」排序, 只输出前 N 个
+  4. 预筛: 国家白名单 (默认 日韩港台新 + 美国) + VPN Gate 自带质量数据 (带宽 / 在线时长 / 有效带宽)
+  5. 并发调用检测 Worker
+  6. 排序: 先按地区 (离大陆近的优先, 美国排最后), 同地区内按检测延迟升序, 只输出前 N 个
   7. 获取并合并优选域名与优选 API (Cloudflare 入口)
   8. 生成 public/data.json + public/index.html + public/nodes.txt + public/nodes-residential.txt
 """
@@ -45,7 +45,8 @@ VPNGATE_MIRROR = os.environ.get(
 )
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "8"))
+# 经 Worker 做一次 SSTP 握手通常要 2~7 秒, 超时不能设太短, 否则会误杀好节点
+CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "20"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
@@ -56,6 +57,14 @@ TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 MIN_SPEED_MBPS = float(os.environ.get("MIN_SPEED_MBPS", "50"))
 # 节点连续在线时长下限 (小时)。刚上线的节点容易掉线。VPN Gate 的 Uptime 字段单位是毫秒
 MIN_UPTIME_HOURS = float(os.environ.get("MIN_UPTIME_HOURS", "1"))
+# 有效带宽下限 (Mbps) = 标称带宽 / (在线人数 + 1)。低于它说明节点太挤
+MIN_EFF_MBPS = float(os.environ.get("MIN_EFF_MBPS", "2"))
+# 国家白名单 + 优先级 (越靠前越优先, 按离中国大陆的距离排)。留空 = 不限制国家
+COUNTRY_PRIORITY = [
+    c.strip().upper()
+    for c in os.environ.get("COUNTRY_PRIORITY", "HK,TW,JP,KR,SG,US").split(",")
+    if c.strip()
+]
 # 在线人数上限, 超过的节点带宽被分得太薄。0 = 不限制
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "0"))
 # nodes.txt 最多输出多少个节点 (宽进严出)。0 = 不限制
@@ -367,28 +376,49 @@ def quality_filter(nodes):
     检测前的预筛: 用 VPN Gate 自带的数据先淘汰明显慢/不稳的节点,
     字段缺失 (None, 比如走了回退镜像) 的不做该项过滤。
     """
-    kept, drop_speed, drop_uptime, drop_sessions = [], 0, 0, 0
+    kept, drop_country, drop_speed, drop_uptime, drop_eff, drop_sessions = [], 0, 0, 0, 0, 0
     for n in nodes:
+        if COUNTRY_PRIORITY and str(n.get("country_code") or "").upper() not in COUNTRY_PRIORITY:
+            drop_country += 1
+            continue
         if n["speed_mbps"] is not None and n["speed_mbps"] < MIN_SPEED_MBPS:
             drop_speed += 1
             continue
         if n["uptime_h"] is not None and n["uptime_h"] < MIN_UPTIME_HOURS:
             drop_uptime += 1
             continue
+        if n["eff_mbps"] is not None and n["eff_mbps"] < MIN_EFF_MBPS:
+            drop_eff += 1
+            continue
         if MAX_SESSIONS > 0 and n["sessions"] is not None and n["sessions"] > MAX_SESSIONS:
             drop_sessions += 1
             continue
         kept.append(n)
-    log("QUALITY", f"预筛: 带宽 < {MIN_SPEED_MBPS:g} Mbps 淘汰 {drop_speed}, 在线 < {MIN_UPTIME_HOURS:g} 小时淘汰 {drop_uptime}"
+    log("QUALITY", f"预筛: 不在白名单 {','.join(COUNTRY_PRIORITY) or '-'} 淘汰 {drop_country}, "
+        f"带宽 < {MIN_SPEED_MBPS:g} Mbps 淘汰 {drop_speed}, 在线 < {MIN_UPTIME_HOURS:g} 小时淘汰 {drop_uptime}, "
+        f"有效带宽 < {MIN_EFF_MBPS:g} Mbps 淘汰 {drop_eff}"
         + (f", 在线人数 > {MAX_SESSIONS} 淘汰 {drop_sessions}" if MAX_SESSIONS > 0 else "")
         + f", 保留 {len(kept)}")
     return kept
 
-def rank_key(n):
-    """排序: 有效带宽降序 → 检测延迟升序 → host。未知带宽排最后"""
+def region_rank(n):
+    code = str(n.get("country_code") or "").upper()
+    return COUNTRY_PRIORITY.index(code) if code in COUNTRY_PRIORITY else len(COUNTRY_PRIORITY)
+
+def bandwidth_key(n):
+    """检测前用: 有效带宽降序 (去重时保留带宽最好的那条)"""
     eff = n.get("eff_mbps")
+    return (eff is None, -(eff or 0), n.get("host") or "")
+
+def rank_key(n):
+    """
+    最终排序: 地区优先级 (港台日韩新在前, 美国在后)
+            → 检测延迟升序 (每个连接都要做 SSTP 握手, 延迟比带宽更影响打开网页的速度)
+            → 有效带宽降序
+    """
     lat = n.get("latency_ms")
-    return (eff is None, -(eff or 0), lat is None, lat or 0, n.get("host") or "")
+    eff = n.get("eff_mbps")
+    return (region_rank(n), lat is None, lat or 0, -(eff or 0), n.get("host") or "")
 
 def dedupe(nodes):
     seen = set()
@@ -508,7 +538,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 def _ranked_available(data):
-    """全部可用节点按有效带宽全局排序 (不再按国家/住宅优先)"""
+    """全部可用节点按 地区 → 延迟 → 有效带宽 排序"""
     return sorted(data["available"], key=rank_key)
 
 def _node_line(entry, n, rank):
@@ -516,13 +546,15 @@ def _node_line(entry, n, rank):
     zh = COUNTRY_ZH.get(code) or (code if code != "?" else (n.get("country") or "未知"))
     tag = "住宅" if n.get("residential") == "residential" else "机房"
     eff = n.get("eff_mbps")
+    lat = n.get("latency_ms")
     bw = f"-{eff:g}M" if eff is not None else ""
-    return f"{entry}#{rank:02d}-{zh}-{tag}{bw}$sstp://vpn:vpn@{n['host']}:{n['port']}"
+    ms = f"-{int(lat)}ms" if lat is not None else ""
+    return f"{entry}#{rank:02d}-{zh}-{tag}{ms}{bw}$sstp://vpn:vpn@{n['host']}:{n['port']}"
 
 def build_nodes_text(data, edge_hosts, residential_only=False, limit=0):
     """
     生成纯节点行版本 (无注释): 每行 = 入口地址#序号-国家-住宅/机房-有效带宽$sstp://...
-    节点按有效带宽从高到低排列, 序号越小越快。
+    节点按 地区 → 延迟 → 有效带宽 排列, 序号越小越优先。
     """
     nodes = _ranked_available(data)
     if residential_only:
@@ -578,7 +610,7 @@ def main():
     if sstp_count == 0:
         die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
     # 先按有效带宽排序再去重, 同一 host 保留质量最好的那条
-    sstp_nodes.sort(key=rank_key)
+    sstp_nodes.sort(key=bandwidth_key)
     uniq = dedupe(sstp_nodes)
     deduped_count = len(uniq)
     uniq = quality_filter(uniq)
