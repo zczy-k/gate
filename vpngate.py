@@ -116,10 +116,11 @@ EDGE_HOSTS = [
 ]
 
 # 优选 API 地址配置 (支持逗号分隔多个，可配置在 GitHub Action Secret / Env 中)
+# 顺序即优先级: 联通 (主用) → 电信 → 移动。API 拿到的 IP 会排在写死的 EDGE_HOSTS 前面
 OPTIMAL_API = os.environ.get(
     "OPTIMAL_API",
+    "https://cf.090227.xyz/cu?ips=10&port=443,"
     "https://cf.090227.xyz/ct?ips=6&port=443,"
-    "https://cf.090227.xyz/cu?port=443,"
     "https://cf.090227.xyz/cmcc?ips=8&port=443"
 )
 
@@ -309,7 +310,8 @@ def fetch_optimal_api_endpoints(api_urls_str):
 
 def get_combined_edge_hosts():
     """
-    合并静态优选域名与优选 API 端点
+    合并优选 API 端点与静态优选域名
+    顺序: API (联通 → 电信 → 移动) 在前, 写死的 EDGE_HOSTS / HOSTS_ENTRY 在后
     """
     # 1. 优先读取 HOSTS_ENTRY 或 EDGE_HOSTS
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
@@ -318,15 +320,15 @@ def get_combined_edge_hosts():
     # 2. 拉取优选 API 端点
     api_hosts = fetch_optimal_api_endpoints(OPTIMAL_API)
 
-    # 3. 合并与去重 (保留原始列表顺序)
+    # 3. 合并与去重: API 在前, 静态域名在后 (保留各自原始顺序)
     combined = []
     seen = set()
-    for h in static_hosts + api_hosts:
+    for h in api_hosts + static_hosts:
         if h and h not in seen:
             seen.add(h)
             combined.append(h)
 
-    log("EDGE POOL", f"汇总入口地址池: 静态域名 {len(static_hosts)} 个, API 获取 {len(api_hosts)} 个, 合并有效入口共 {len(combined)} 个")
+    log("EDGE POOL", f"汇总入口地址池: API 获取 {len(api_hosts)} 个 (排在前面), 静态域名 {len(static_hosts)} 个 (排在后面), 合并有效入口共 {len(combined)} 个")
     return combined if combined else EDGE_HOSTS
 
 # ---------------------------------------------------------------------------
